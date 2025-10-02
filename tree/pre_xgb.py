@@ -4,7 +4,6 @@ Weak XGB prefilter for header detection
 Computes ball kinematics features and trains XGB to prune easy negatives
 """
 
-import os
 import sys
 import numpy as np
 import pandas as pd
@@ -17,11 +16,13 @@ from sklearn.model_selection import KFold
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 import xgboost as xgb
 
-# Add paths
-sys.path.append('../configs')
-sys.path.append('../../DeepImpact/data-prep')
+HEADER_NET_ROOT = Path(__file__).resolve().parents[1]
+if str(HEADER_NET_ROOT) not in sys.path:
+    sys.path.append(str(HEADER_NET_ROOT))
 
-from header_default import *
+from configs import header_default as cfg
+from utils.detections import load_ball_det_dict, make_video_key
+from utils.labels import load_header_labels, build_half_frame_lookup
 
 def compute_kinematics_features(ball_positions, fps=25):
     """
@@ -179,58 +180,8 @@ def extract_features_from_video(video_id, ball_det_dict, fps=25):
     
     return features
 
-def load_header_labels(dataset_path):
-    """Load header labels from Excel/ODS files"""
-    labels = {}
-    
-    header_dataset_path = os.path.join(dataset_path, "header_dataset")
-    
-    # Load from SoccerNetV2 annotations
-    soccernet_path = os.path.join(header_dataset_path, "SoccerNetV2")
-    if os.path.exists(soccernet_path):
-        for league_dir in os.listdir(soccernet_path):
-            league_path = os.path.join(soccernet_path, league_dir)
-            if not os.path.isdir(league_path):
-                continue
-                
-            for season_dir in os.listdir(league_path):
-                season_path = os.path.join(league_path, season_dir)
-                if not os.path.isdir(season_path):
-                    continue
-                    
-                for match_dir in os.listdir(season_path):
-                    match_path = os.path.join(season_path, match_dir)
-                    if not os.path.isdir(match_path):
-                        continue
-                    
-                    # Look for header annotation files
-                    for half in [1, 2]:
-                        for file_pattern in [f"{half}_framed.xlsx", f"{half}_HQ_framed.xlsx", f"{half}_framed.ods"]:
-                            file_path = os.path.join(match_path, file_pattern)
-                            if os.path.exists(file_path):
-                                try:
-                                    if file_path.endswith('.xlsx'):
-                                        df = pd.read_excel(file_path)
-                                    elif file_path.endswith('.ods'):
-                                        df = pd.read_excel(file_path, engine='odf')
-                                    
-                                    # Extract frame numbers (assuming first column contains frame numbers)
-                                    if len(df.columns) > 0:
-                                        frame_numbers = df.iloc[:, 0].dropna().astype(int).tolist()
-                                        
-                                        video_id = f"{match_dir}_{half}"
-                                        if video_id not in labels:
-                                            labels[video_id] = []
-                                        labels[video_id].extend(frame_numbers)
-                                        
-                                        print(f"Loaded {len(frame_numbers)} header frames from {file_path}")
-                                
-                                except Exception as e:
-                                    print(f"Error loading {file_path}: {e}")
-    
-    return labels
 
-def create_training_data(ball_det_dict, header_labels, neg_sampling_ratio=3.0):
+def create_training_data(ball_det_dict, labels_df, neg_sampling_ratio=3.0):
     """Create training dataset with features and labels"""
     feature_names = [
         'x', 'y', 'vx', 'vy', 'speed', 'ax', 'ay', 'accel_mag',
@@ -244,56 +195,55 @@ def create_training_data(ball_det_dict, header_labels, neg_sampling_ratio=3.0):
     X = []
     y = []
     metadata = []
+
+    label_lookup = build_half_frame_lookup(labels_df)
+    rng = np.random.default_rng(2024)
     
     print("Extracting features from videos...")
     for video_id in tqdm(ball_det_dict.keys()):
-        # Extract kinematic features
         features = extract_features_from_video(video_id, ball_det_dict)
-        
         if not features:
             continue
-        
-        # Get header labels for this video
-        header_frames = set(header_labels.get(video_id, []))
-        
-        # Collect positive samples
+
+        header_frames = set(label_lookup.get(video_id, []))
+        if not header_frames:
+            continue
+
         positive_samples = []
         for frame_id, feat_dict in features.items():
             if frame_id in header_frames:
                 feat_vector = [feat_dict.get(fn, 0.0) for fn in feature_names]
                 X.append(feat_vector)
-                y.append(1)  # Header
+                y.append(1)
                 metadata.append({'video_id': video_id, 'frame_id': frame_id, 'label': 'header'})
                 positive_samples.append(frame_id)
-        
-        # Sample negative samples
+
         negative_frames = [fid for fid in features.keys() if fid not in header_frames]
         if negative_frames and positive_samples:
-            # Sample negatives based on ratio
             n_negatives = min(len(negative_frames), int(len(positive_samples) * neg_sampling_ratio))
-            sampled_negatives = np.random.choice(negative_frames, n_negatives, replace=False)
-            
+            sampled_negatives = rng.choice(negative_frames, n_negatives, replace=False)
             for frame_id in sampled_negatives:
                 feat_dict = features[frame_id]
                 feat_vector = [feat_dict.get(fn, 0.0) for fn in feature_names]
                 X.append(feat_vector)
-                y.append(0)  # Non-header
+                y.append(0)
                 metadata.append({'video_id': video_id, 'frame_id': frame_id, 'label': 'background'})
-    
+
     X = np.array(X)
     y = np.array(y)
-    
+
     print(f"Created training data: {len(y)} samples")
-    print(f"Positive samples: {np.sum(y)} ({np.mean(y)*100:.1f}%)")
-    print(f"Negative samples: {len(y) - np.sum(y)} ({(1-np.mean(y))*100:.1f}%)")
-    
+    if len(y) > 0:
+        print(f"Positive samples: {np.sum(y)} ({np.mean(y)*100:.1f}%)")
+        print(f"Negative samples: {len(y) - np.sum(y)} ({(1-np.mean(y))*100:.1f}%)")
+
     return X, y, metadata, feature_names
 
 def train_pre_xgb(X, y, feature_names, output_dir, n_folds=5):
     """Train XGB prefilter with cross-validation"""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # XGB parameters
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     params = {
         'objective': 'binary:logistic',
         'eval_metric': 'auc',
@@ -302,73 +252,68 @@ def train_pre_xgb(X, y, feature_names, output_dir, n_folds=5):
         'subsample': 0.8,
         'colsample_bytree': 0.8,
         'random_state': 42,
-        'n_estimators': 100
+        'n_estimators': 100,
+        'n_jobs': 1
     }
-    
-    # Cross-validation
+
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     cv_scores = []
     models = []
-    
+
     print(f"Training XGB with {n_folds}-fold cross-validation...")
-    
+
     for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
         print(f"\nFold {fold + 1}/{n_folds}")
-        
+
         X_train, X_val = X[train_idx], X[val_idx]
         y_train, y_val = y[train_idx], y[val_idx]
-        
-        # Train model
+
+        print(f'Training fold {fold + 1} with {len(train_idx)} samples', flush=True)
         model = xgb.XGBClassifier(**params)
         model.fit(X_train, y_train)
-        
-        # Validate
+
         y_pred_proba = model.predict_proba(X_val)[:, 1]
         auc = roc_auc_score(y_val, y_pred_proba)
-        
+
         precision, recall, f1, _ = precision_recall_fscore_support(
             y_val, y_pred_proba > 0.5, average='binary'
         )
-        
+
         print(f"Fold {fold + 1} - AUC: {auc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
-        
+
         cv_scores.append(auc)
         models.append(model)
-        
-        # Save fold model
-        model_path = os.path.join(output_dir, f'pre_xgb_fold_{fold}.pkl')
+
+        model_path = output_dir / f'pre_xgb_fold_{fold}.pkl'
         with open(model_path, 'wb') as f:
             pickle.dump(model, f)
-    
+
     print(f"\nCross-validation AUC: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
-    
-    # Train final model on all data
+
     print("Training final model on all data...")
+    print('Training final model', flush=True)
     final_model = xgb.XGBClassifier(**params)
     final_model.fit(X, y)
-    
-    # Save final model
-    final_model_path = os.path.join(output_dir, 'pre_xgb_final.pkl')
+
+    final_model_path = output_dir / 'pre_xgb_final.pkl'
     with open(final_model_path, 'wb') as f:
         pickle.dump(final_model, f)
-    
-    # Save feature names
-    feature_path = os.path.join(output_dir, 'feature_names.pkl')
+
+    feature_path = output_dir / 'feature_names.pkl'
     with open(feature_path, 'wb') as f:
         pickle.dump(feature_names, f)
-    
-    # Feature importance
+
     importance_df = pd.DataFrame({
         'feature': feature_names,
         'importance': final_model.feature_importances_
     }).sort_values('importance', ascending=False)
-    
-    importance_path = os.path.join(output_dir, 'feature_importance.csv')
+
+    importance_path = output_dir / 'feature_importance.csv'
     importance_df.to_csv(importance_path, index=False)
-    
+
     print(f"\nTop 10 most important features:")
     print(importance_df.head(10))
-    
+
     return final_model, models, cv_scores
 
 def generate_proposals(ball_det_dict, model, feature_names, threshold=0.5, max_proposals_per_minute=5):
@@ -417,11 +362,13 @@ def generate_proposals(ball_det_dict, model, feature_names, threshold=0.5, max_p
 
 def main():
     parser = argparse.ArgumentParser(description='Train weak XGB prefilter for header detection')
-    parser.add_argument('--dataset_path', type=str, default='../../DeepImpact', 
-                        help='Path to dataset')
-    parser.add_argument('--ball_det_dict_path', type=str, default='../cache/ball_det_dict.npy',
+    parser.add_argument('--dataset_path', type=str, default=str(cfg.DATASET_PATH),
+                        help='Path to dataset root')
+    parser.add_argument('--header_dataset', type=str, default=str(cfg.DATASET_PATH / 'header_dataset'),
+                        help='Path to header annotation dataset')
+    parser.add_argument('--ball_det_dict_path', type=str, default=str(cfg.BALL_DET_DICT_PATH),
                         help='Path to ball detection dictionary')
-    parser.add_argument('--output_dir', type=str, default='pre_xgb',
+    parser.add_argument('--output_dir', type=str, default=str(cfg.CACHE_PATH / 'pre_xgb'),
                         help='Output directory for models and results')
     parser.add_argument('--neg_ratio', type=float, default=3.0,
                         help='Negative to positive sampling ratio')
@@ -433,20 +380,22 @@ def main():
                         help='Number of CV folds')
     
     args = parser.parse_args()
-    
-    # Load ball detection dictionary
-    print(f"Loading ball detection dictionary from {args.ball_det_dict_path}")
-    ball_det_dict = np.load(args.ball_det_dict_path, allow_pickle=True).item()
+
+    dataset_path = Path(args.dataset_path)
+    header_dataset_path = Path(args.header_dataset)
+    ball_det_path = Path(args.ball_det_dict_path)
+    output_dir = Path(args.output_dir)
+
+    print(f"Loading ball detection dictionary from {ball_det_path}")
+    ball_det_dict = load_ball_det_dict(ball_det_path)
     print(f"Loaded detections for {len(ball_det_dict)} videos")
-    
-    # Load header labels
-    print(f"Loading header labels from {args.dataset_path}")
-    header_labels = load_header_labels(args.dataset_path)
-    print(f"Loaded header labels for {len(header_labels)} videos")
-    
-    # Create training data
+
+    print(f"Loading header labels from {header_dataset_path}")
+    labels_df = load_header_labels(header_dataset_path)
+    print(f"Loaded {len(labels_df)} header events across {labels_df['video_id'].nunique()} videos")
+
     X, y, metadata, feature_names = create_training_data(
-        ball_det_dict, header_labels, args.neg_ratio
+        ball_det_dict, labels_df, args.neg_ratio
     )
     
     if len(X) == 0:
@@ -455,7 +404,7 @@ def main():
     
     # Train model
     final_model, fold_models, cv_scores = train_pre_xgb(
-        X, y, feature_names, args.output_dir, args.n_folds
+        X, y, feature_names, output_dir, args.n_folds
     )
     
     # Generate proposals
@@ -465,7 +414,7 @@ def main():
     )
     
     # Save proposals
-    proposals_path = os.path.join(args.output_dir, 'proposals.pkl')
+    proposals_path = output_dir / 'proposals.pkl'
     with open(proposals_path, 'wb') as f:
         pickle.dump(proposals, f)
     
@@ -481,7 +430,7 @@ def main():
             })
     
     proposals_df = pd.DataFrame(proposals_csv_data)
-    proposals_csv_path = os.path.join(args.output_dir, 'proposals.csv')
+    proposals_csv_path = output_dir / 'proposals.csv'
     proposals_df.to_csv(proposals_csv_path, index=False)
     
     print(f"\nGenerated {len(proposals_csv_data)} total proposals")
@@ -490,10 +439,10 @@ def main():
     
     # Save training metadata
     metadata_df = pd.DataFrame(metadata)
-    metadata_path = os.path.join(args.output_dir, 'training_metadata.csv')
+    metadata_path = output_dir / 'training_metadata.csv'
     metadata_df.to_csv(metadata_path, index=False)
     
-    print(f"Training complete! Models and results saved to {args.output_dir}")
+    print(f"Training complete! Models and results saved to {output_dir}")
 
 if __name__ == "__main__":
     main()
