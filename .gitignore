@@ -1,2 +1,9 @@
-cache/
+*.npy
+cache/pre_xgb/
+header_net/pre_xgb/
 dataset/
+RFDETR-Soccernet/
+__pycache__/
+checkpoints/
+report/
+scratch_output/

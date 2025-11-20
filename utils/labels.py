@@ -1,11 +1,12 @@
 """Utilities for loading header annotations."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Iterable, List
 
 import pandas as pd
+
+from .videos import infer_half_from_stem
 
 
 def _extract_numeric_frames(df: pd.DataFrame) -> List[int]:
@@ -29,10 +30,7 @@ def _extract_numeric_frames(df: pd.DataFrame) -> List[int]:
 
 
 def _infer_half_from_name(name: str) -> int:
-    match = re.search(r"(^|[^0-9])([12])([^0-9]|$)", name)
-    if match:
-        return int(match.group(2))
-    return 1
+    return infer_half_from_stem(name)
 
 
 def load_header_labels(header_dataset_root: Path) -> pd.DataFrame:
@@ -47,13 +45,19 @@ def load_header_labels(header_dataset_root: Path) -> pd.DataFrame:
 
     soccernet_root = header_dataset_root / "SoccerNetV2"
     if soccernet_root.exists():
-        for match_dir in soccernet_root.iterdir():
+        for match_dir in soccernet_root.rglob("*"):
             if not match_dir.is_dir():
                 continue
+            label_files = [
+                file_path
+                for file_path in match_dir.iterdir()
+                if file_path.is_file() and file_path.suffix.lower() in {".xlsx", ".ods", ".csv"}
+            ]
+            if not label_files:
+                continue
+
             video_id = match_dir.name
-            for file_path in match_dir.glob("*.*"):
-                if file_path.suffix.lower() not in {".xlsx", ".ods", ".csv"}:
-                    continue
+            for file_path in label_files:
                 try:
                     if file_path.suffix.lower() == ".csv":
                         df = pd.read_csv(file_path)

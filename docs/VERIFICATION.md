@@ -4,11 +4,20 @@ Use this checklist to confirm the preprocessing stack is healthy after any chang
 
 ## 0. Environment
 - Activate the project environment: `conda activate deep_impact_env`.
+- Change into the project directory: `cd header_net`.
 
 ## 1. Detection Dictionary
 ```
 python cache/build_ball_det_dict.py \
     --dataset-path ../DeepImpact \
+    --output cache/ball_det_dict.npy
+
+# RF-DETR inference (specify weights if you have a fine-tuned checkpoint)
+python cache/build_ball_det_dict.py \
+    --dataset-path ../DeepImpact \
+    --detector rf-detr \
+    --detector-weights checkpoints/rf-detr-medium.pth \
+    --rf-target-classes "sports ball" \
     --output cache/ball_det_dict.npy
 ```
 - Expects: summary line like `Saved detections for <N> videos`. Any `Skipped … without detections` entries mean the YOLO outputs were missing; either supply them under `YOLO_DETECTIONS_PATH` or rely on the fallback (centre crops around labelled frames).

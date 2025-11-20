@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import Any, Dict, Iterable
 
 import numpy as np
 
-BallDetections = Dict[str, Dict[int, Dict[int, Dict[str, float]]]]
+BallDetections = Dict[str, Dict[int, Dict[int, Dict[str, Any]]]]
 
 
 def make_video_key(match_name: str, half: int) -> str:
