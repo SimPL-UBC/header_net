@@ -1,24 +1,22 @@
-# Header Cache Generation
+# Dataset Generation
 
-This document describes how to generate the training cache for the HeaderNet model using the optimized `build_det_dict_fine_tuned.py` script.
+This document describes how to generate the training dataset (positive and negative samples) for the HeaderNet model using the `generate_positive_negative_dataset.py` script.
 
 ## Overview
 
-The `build_det_dict_fine_tuned.py` script has been optimized to perform **sparse detection**. Instead of processing every frame in a video, it:
+The `dataset_generation/generate_positive_negative_dataset.py` script performs **sparse detection** to efficiently create training samples. It:
 1.  Loads positive header events from the dataset.
 2.  Generates negative samples (random frames without header events).
 3.  Identifies the specific frames required for these samples (including temporal windows).
 4.  Runs the RF-DETR object detector *only* on these frames.
 5.  Generates the final cache (cropped images and metadata) directly.
 
-This approach is significantly faster than the previous two-step process (full video detection -> cache generation) because it avoids processing the vast majority of frames that are not used for training.
-
 ## Usage
 
 ### Basic Command
 
 ```bash
-python cache/build_det_dict_fine_tuned.py \
+python dataset_generation/generate_positive_negative_dataset.py \
     --dataset-path /path/to/SoccerNet \
     --header-dataset /path/to/annotations \
     --weights /path/to/rtdetr_weights.pt \
@@ -39,7 +37,7 @@ python cache/build_det_dict_fine_tuned.py \
 To generate a cache with 5x negative samples and a larger guard window:
 
 ```bash
-python cache/build_det_dict_fine_tuned.py \
+python dataset_generation/generate_positive_negative_dataset.py \
     --negative-ratio 5.0 \
     --guard-frames 20 \
     --output-dir cache/my_custom_cache
