@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a detection dictionary using the fine-tuned SoccerNet RF-DETR model."""
+"""Build a detection dictionary using the fine-tuned SoccerNet RF-DETR model with negative sampling."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -27,30 +27,13 @@ from utils.labels import load_header_labels  # noqa: E402
 
 from detectors.rf_detr.model import RFDetrConfig, RFDetrInference, build_rf_detr  # noqa: E402
 
-from cache.build_ball_det_dict import VideoInfo, discover_videos  # noqa: E402
-
-def _load_label_helpers():
-    module_name = "cache.build_labelled_only_ball_det_dict"
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError:
-        module_path = HEADER_NET_ROOT / "cache" / "build_labelled-only_ball_det_dict.py"
-        if not module_path.exists():
-            raise
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        if spec is None or spec.loader is None:  # pragma: no cover - defensive guard
-            raise ImportError(f"Unable to load helpers from {module_path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        sys.modules[module_name] = module
-        return module
-
-
-_label_module = _load_label_helpers()
-collect_labelled_videos = _label_module.collect_labelled_videos
-load_labels_dataframe = _label_module.load_labels_dataframe
-build_label_lookup = _label_module.build_label_lookup
-
+# Import from create_cache_header for merged functionality
+from cache.create_cache_header import (
+    create_header_cache,
+    discover_video_sources,
+    generate_negative_samples,
+    VideoSource,
+)
 
 FrameDetections = Dict[int, Dict[int, Dict[str, float]]]
 VideoDetections = Dict[str, FrameDetections]
@@ -110,7 +93,7 @@ class SoccerNetInference:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build ball/player detection dictionary using fine-tuned SoccerNet RF-DETR"
+        description="Build ball/player detection dictionary using fine-tuned SoccerNet RF-DETR with negative sampling"
     )
     parser.add_argument(
         "--dataset-path",
@@ -128,21 +111,15 @@ def parse_args() -> argparse.Namespace:
         help="Path to fine-tuned RF-DETR SoccerNet weights",
     )
     parser.add_argument(
-        "--output",
-        default=str(cfg.BALL_PLAYER_DET_DICT_PATH),
-        help="Output path for the detection dictionary",
+        "--output-dir",
+        default=str(cfg.CACHE_PATH / "cache_header"),
+        help="Directory to store generated cache",
     )
     parser.add_argument(
         "--confidence-threshold",
         type=float,
         default=0.25,
         help="Score threshold for detections",
-    )
-    parser.add_argument(
-        "--frame-stride",
-        type=int,
-        default=1,
-        help="Process every Nth frame (>=1)",
     )
     parser.add_argument(
         "--batch-size",
@@ -178,18 +155,38 @@ def parse_args() -> argparse.Namespace:
         help="Enable torch compile during optimization",
     )
     parser.add_argument(
-        "--missing-report",
-        default=str(cfg.CACHE_PATH / "missing_soccernet_detections.csv"),
-        help="Path to CSV capturing labelled frames without ball detections",
+        "--negative-ratio",
+        type=float,
+        default=3.0,
+        help="Number of negatives per positive",
+    )
+    parser.add_argument(
+        "--guard-frames",
+        type=int,
+        default=10,
+        help="Frames to exclude around each positive sample",
+    )
+    parser.add_argument(
+        "--window",
+        nargs="*",
+        type=int,
+        default=cfg.WINDOW_SIZE,
+        help="Temporal window offsets",
+    )
+    parser.add_argument(
+        "--crop-scale-factor",
+        type=float,
+        default=cfg.CROP_SCALE_FACTOR,
+        help="Scale factor for crop radius relative to ball size",
     )
     return parser.parse_args()
 
 
-def run_soccernet_on_video(
-    video: VideoInfo,
+def run_soccernet_on_video_sparse(
+    video: VideoSource,
     model: SoccerNetInference,
+    target_frames: Set[int],
     batch_size: int,
-    frame_stride: int,
     score_threshold: float,
     topk: int,
 ) -> Dict[int, List[Dict[str, float]]]:
@@ -197,35 +194,44 @@ def run_soccernet_on_video(
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video {video.path}")
 
-    frame_id = 0
-    frames: List[np.ndarray] = []
-    indices: List[int] = []
+    sorted_frames = sorted(target_frames)
     raw: Dict[int, List[Dict[str, float]]] = {}
+    
+    batch_frames: List[np.ndarray] = []
+    batch_indices: List[int] = []
 
-    while True:
+    # Optimize seeking: if frames are sequential, read sequentially.
+    # Otherwise seek.
+    
+    current_pos = -1
+    
+    for frame_id in sorted_frames:
+        if frame_id >= video.frame_count:
+            continue
+            
+        if current_pos != frame_id:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+            current_pos = frame_id
+        
         ret, frame = cap.read()
         if not ret:
             break
-        if frame_stride > 1 and frame_id % frame_stride != 0:
-            frame_id += 1
-            continue
+        current_pos += 1 # Advance position after read
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(rgb)
-        indices.append(frame_id)
+        batch_frames.append(rgb)
+        batch_indices.append(frame_id)
 
-        if len(frames) >= batch_size:
-            preds = model(frames, score_threshold=score_threshold, topk=topk)
-            for fid, dets in zip(indices, preds):
+        if len(batch_frames) >= batch_size:
+            preds = model(batch_frames, score_threshold=score_threshold, topk=topk)
+            for fid, dets in zip(batch_indices, preds):
                 raw[fid] = dets
-            frames.clear()
-            indices.clear()
+            batch_frames.clear()
+            batch_indices.clear()
 
-        frame_id += 1
-
-    if frames:
-        preds = model(frames, score_threshold=score_threshold, topk=topk)
-        for fid, dets in zip(indices, preds):
+    if batch_frames:
+        preds = model(batch_frames, score_threshold=score_threshold, topk=topk)
+        for fid, dets in zip(batch_indices, preds):
             raw[fid] = dets
 
     cap.release()
@@ -233,11 +239,23 @@ def run_soccernet_on_video(
 
 
 def smooth_ball_detections(raw: Dict[int, List[Dict[str, float]]]) -> Dict[int, Dict[str, float]]:
+    # Note: Kalman smoothing on sparse frames is tricky. 
+    # If the window is contiguous, it works locally.
+    # If frames are far apart, predict() will project far into the future/past which might be bad.
+    # However, for the purpose of this cache generation, we are mostly interested in the window around the event.
+    # We will reset the Kalman filter if the gap is too large.
+    
     kalman = KalmanFilter4D()
     smoothed: Dict[int, Dict[str, float]] = {}
     last_size: Optional[Tuple[float, float]] = None
+    last_frame_id: Optional[int] = None
+    MAX_GAP = 5 # Reset if gap is larger than this
 
     for frame_id in sorted(raw.keys()):
+        if last_frame_id is not None and (frame_id - last_frame_id) > MAX_GAP:
+             kalman = KalmanFilter4D() # Reset
+             last_size = None
+
         detections = raw.get(frame_id, [])
         ball_candidates = [det for det in detections if int(det.get("class_id", -1)) == 0]
 
@@ -246,7 +264,7 @@ def smooth_ball_detections(raw: Dict[int, List[Dict[str, float]]]) -> Dict[int, 
             x, y, w, h = best["box"]
             cx = x + w / 2.0
             cy = y + h / 2.0
-            if smoothed:
+            if smoothed and kalman._state is not None:
                 kalman.predict()
                 kalman.update(cx, cy)
             else:
@@ -264,9 +282,11 @@ def smooth_ball_detections(raw: Dict[int, List[Dict[str, float]]]) -> Dict[int, 
             )
             smoothed[frame_id] = entry
             last_size = (w, h)
+            last_frame_id = frame_id
             continue
 
-        if kalman._state is None or last_size is None:  # noqa: SLF001
+        if kalman._state is None or last_size is None:
+            last_frame_id = frame_id
             continue
 
         kalman.predict()
@@ -280,6 +300,7 @@ def smooth_ball_detections(raw: Dict[int, List[Dict[str, float]]]) -> Dict[int, 
             "velocity": [vx, vy],
             "source": "kalman",
         }
+        last_frame_id = frame_id
 
     return smoothed
 
@@ -310,86 +331,51 @@ def assemble_frame_detections(
     return frames
 
 
-def build_detection_dict(
-    videos: Iterable[VideoInfo],
-    model: SoccerNetInference,
-    batch_size: int,
-    frame_stride: int,
-    score_threshold: float,
-    topk: int,
-) -> VideoDetections:
-    detections: VideoDetections = {}
-
-    for video in tqdm(list(videos), desc="Videos"):
-        raw = run_soccernet_on_video(
-            video,
-            model,
-            batch_size=batch_size,
-            frame_stride=frame_stride,
-            score_threshold=score_threshold,
-            topk=topk,
-        )
-        ball = smooth_ball_detections(raw)
-        frames = assemble_frame_detections(raw, ball)
-        if frames:
-            detections[video.video_id] = frames
-
-    return detections
-
-
-def report_missing_ball_frames(
-    detections: VideoDetections,
-    label_lookup: Dict[str, Sequence[int]],
-) -> List[Dict[str, object]]:
-    missing: List[Dict[str, object]] = []
-    for video_id, frames in label_lookup.items():
-        frame_map = detections.get(video_id, {})
-        for frame in frames:
-            entry = frame_map.get(int(frame), {})
-            ball_entry = entry.get(0)
-            if not ball_entry:
-                missing.append({"video_id": video_id, "frame": int(frame)})
-    return missing
-
-
 def main() -> None:
     args = parse_args()
 
-    if args.frame_stride < 1:
-        raise ValueError("frame-stride must be >= 1")
     if args.batch_size < 1:
         raise ValueError("batch-size must be >= 1")
 
     dataset_path = Path(args.dataset_path)
     header_dataset = Path(args.header_dataset)
     weights_path = Path(args.weights)
-    output_path = Path(args.output)
-    missing_report = Path(args.missing_report)
+    output_dir = Path(args.output_dir)
+    window = args.window if args.window else cfg.WINDOW_SIZE
 
-    videos = discover_videos(dataset_path)
-    if not videos:
-        raise SystemExit("No SoccerNet videos discovered. Check dataset path.")
-
-    labels_df, resolved_header_root = load_labels_dataframe(header_dataset)
+    # 1. Load Labels
+    labels_df = load_header_labels(header_dataset)
     if labels_df.empty:
         raise SystemExit("No header labels found. Verify header dataset path.")
     print(f"[INFO] Loaded {len(labels_df)} header labels")
 
-    filtered_videos, missing_halves, name_map, skipped = collect_labelled_videos(videos, labels_df)
-    if not filtered_videos:
-        raise SystemExit("No labelled videos matched dataset contents. Check naming conventions.")
+    # 2. Discover Videos
+    match_names = set(labels_df["video_id"].astype(str))
+    sources = discover_video_sources(dataset_path, matches=match_names)
+    print(f"[INFO] Indexed {len(sources)} video sources")
 
-    print(f"[INFO] Using {len(filtered_videos)} labelled videos for detection")
-    if missing_halves:
-        print("[WARN] Missing video files for labelled matches:")
-        for match, halves in sorted(missing_halves.items()):
-            half_list = ", ".join(str(h) for h in sorted(halves))
-            print(f"  {match}: half(s) {half_list}")
-    if skipped:
-        preview = ", ".join(sorted(skipped)[:10])
-        suffix = " ..." if len(skipped) > 10 else ""
-        print(f"[INFO] Ignoring labels without videos: {preview}{suffix}")
+    # 3. Generate Negative Samples
+    # We need an empty detections dict for generate_negative_samples because we haven't run detection yet.
+    # The original logic used detections to avoid sampling frames that already had detections?
+    # Checking create_cache_header.py:
+    # "det_frames = set(detections.get(key, {}).keys()) ... if det_frames: available_frames = det_frames else: available_frames = set(range(source.frame_count))"
+    # Since we want to sample from the whole video (minus positives), we pass empty detections so it falls back to range(frame_count).
+    
+    print("[INFO] Generating negative samples...")
+    negatives_df = generate_negative_samples(
+        labels_df,
+        {}, # No pre-existing detections
+        sources,
+        args.negative_ratio,
+        args.guard_frames,
+        window,
+    )
+    print(f"[INFO] Generated {len(negatives_df)} negative samples")
 
+    all_labels = pd.concat([labels_df, negatives_df], ignore_index=True)
+    print(f"[INFO] Total samples to process: {len(all_labels)}")
+
+    # 4. Initialize Model
     inference = SoccerNetInference.build(
         weights_path=weights_path,
         device=args.device,
@@ -399,32 +385,52 @@ def main() -> None:
     )
     print(f"[INFO] SoccerNet RF-DETR running on {inference.device}")
 
-    detections = build_detection_dict(
-        filtered_videos,
-        model=inference,
-        batch_size=args.batch_size,
-        frame_stride=args.frame_stride,
-        score_threshold=args.confidence_threshold,
-        topk=args.topk,
+    # 5. Process Videos (Sparse Detection)
+    detections: VideoDetections = {}
+    
+    # Group by video to minimize video opening/closing
+    for (match_name, half), group in tqdm(all_labels.groupby(["video_id", "half"], sort=False), desc="Processing Videos"):
+        key = make_video_key(match_name, int(half))
+        source = sources.get(key)
+        if source is None:
+            continue
+
+        # Identify all frames needed for this video
+        target_frames: Set[int] = set()
+        for frame_val in group['frame'].astype(int):
+            for offset in window:
+                target_frames.add(frame_val + offset)
+        
+        # Run detection on these frames
+        raw = run_soccernet_on_video_sparse(
+            source,
+            inference,
+            target_frames,
+            batch_size=args.batch_size,
+            score_threshold=args.confidence_threshold,
+            topk=args.topk,
+        )
+        
+        ball = smooth_ball_detections(raw)
+        frames = assemble_frame_detections(raw, ball)
+        if frames:
+            detections[key] = frames
+
+    # 6. Create Cache
+    print("[INFO] Creating cache files...")
+    cache_df = create_header_cache(
+        detections,
+        all_labels,
+        sources,
+        output_dir,
+        window,
+        args.crop_scale_factor,
+        cfg.OUTPUT_SIZE,
+        cfg.LOW_RES_OUTPUT_SIZE,
+        cfg.LOW_RES_MAX_DIM,
     )
 
-    label_lookup = build_label_lookup(labels_df)
-    missing_frames = report_missing_ball_frames(detections, label_lookup)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(output_path, detections)
-    print(f"Saved detections for {len(detections)} videos to {output_path}")
-
-    if missing_frames:
-        missing_report.parent.mkdir(parents=True, exist_ok=True)
-        df = pd.DataFrame(missing_frames)
-        df.sort_values(["video_id", "frame"], inplace=True)
-        df.to_csv(missing_report, index=False)
-        print(f"[WARN] Logged {len(missing_frames)} labelled frames without ball detections to {missing_report}")
-    else:
-        if missing_report.exists():
-            missing_report.unlink()
-        print("All labelled frames have a corresponding ball detection.")
+    print(f"[INFO] Created {len(cache_df)} cache samples in {output_dir}")
 
 
 if __name__ == "__main__":

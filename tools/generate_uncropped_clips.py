@@ -161,6 +161,24 @@ def build_video_index(soccer_root: Path, matches: Set[str]) -> Dict[str, VideoSo
             fps=fps if fps > 0 else 25.0,
         )
 
+    def process_match_dir(match_dir: Path) -> None:
+        display_name = match_dir.name
+        canonical_match = canonical_match_name(display_name)
+        if matches and canonical_match not in matches:
+            return
+        for video_file in match_dir.iterdir():
+            if not video_file.is_file():
+                continue
+            if video_file.suffix.lower() not in {".mp4", ".mkv"}:
+                continue
+            consider_video(video_file, canonical_match, display_name)
+
+    # Strategy 1: Flat structure (Match directories directly in root)
+    for match_dir in soccer_root.iterdir():
+        if match_dir.is_dir():
+            process_match_dir(match_dir)
+
+    # Strategy 2: Nested structure (League/Season/Match)
     for league_dir in soccer_root.iterdir():
         if not league_dir.is_dir():
             continue
@@ -168,18 +186,8 @@ def build_video_index(soccer_root: Path, matches: Set[str]) -> Dict[str, VideoSo
             if not season_dir.is_dir():
                 continue
             for match_dir in season_dir.iterdir():
-                if not match_dir.is_dir():
-                    continue
-                display_name = match_dir.name
-                canonical_match = canonical_match_name(display_name)
-                if matches and canonical_match not in matches:
-                    continue
-                for video_file in match_dir.iterdir():
-                    if not video_file.is_file():
-                        continue
-                    if video_file.suffix.lower() not in {".mp4", ".mkv"}:
-                        continue
-                    consider_video(video_file, canonical_match, display_name)
+                if match_dir.is_dir():
+                    process_match_dir(match_dir)
     return sources
 
 
