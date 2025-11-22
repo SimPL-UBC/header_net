@@ -65,7 +65,8 @@ def load_header_labels(header_dataset_root: Path) -> pd.DataFrame:
                         df = pd.read_excel(file_path, engine="odf")
                     else:
                         df = pd.read_excel(file_path)
-                except Exception:
+                except Exception as e:
+                    print(f"[WARN] Failed to read label file {file_path}: {e}")
                     continue
 
                 frames = _extract_numeric_frames(df)
@@ -93,7 +94,8 @@ def load_header_labels(header_dataset_root: Path) -> pd.DataFrame:
                     df = pd.read_csv(file_path)
                 else:
                     df = pd.read_excel(file_path)
-            except Exception:
+            except Exception as e:
+                print(f"[WARN] Failed to read label file {file_path}: {e}")
                 continue
 
             frames = _extract_numeric_frames(df)

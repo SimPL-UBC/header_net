@@ -21,7 +21,6 @@ if str(HEADER_NET_ROOT) not in sys.path:
 from configs import header_default as cfg  # noqa: E402
 from utils.detections import make_video_key  # noqa: E402
 from utils.kalman import KalmanFilter4D  # noqa: E402
-from utils.labels import load_header_labels  # noqa: E402
 
 from detectors.rf_detr.model import RFDetrConfig, RFDetrInference, build_rf_detr  # noqa: E402
 
@@ -30,6 +29,7 @@ from dataset_generation.dataset_utils import (
     create_header_cache,
     discover_video_sources,
     generate_negative_samples,
+    load_labels_dataframe,
     VideoSource,
 )
 
@@ -342,10 +342,10 @@ def main() -> None:
     window = args.window if args.window else cfg.WINDOW_SIZE
 
     # 1. Load Labels
-    labels_df = load_header_labels(header_dataset)
+    labels_df, resolved_root = load_labels_dataframe(header_dataset)
     if labels_df.empty:
-        raise SystemExit("No header labels found. Verify header dataset path.")
-    print(f"[INFO] Loaded {len(labels_df)} header labels")
+        raise SystemExit(f"No header labels found. Verify header dataset path: {header_dataset}")
+    print(f"[INFO] Loaded {len(labels_df)} header labels from {resolved_root}")
 
     # 2. Discover Videos
     match_names = set(labels_df["video_id"].astype(str))

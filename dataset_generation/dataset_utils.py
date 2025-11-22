@@ -28,6 +28,15 @@ from utils.detections import (
 )
 
 
+def load_labels_dataframe(header_dataset: Path) -> Tuple[pd.DataFrame, Optional[Path]]:
+    """Load header labels from the specified dataset path."""
+    header_dataset = header_dataset.expanduser()
+    df = load_header_labels(header_dataset)
+    if not df.empty:
+        return df, header_dataset
+    return pd.DataFrame(), None
+
+
 @dataclass
 class VideoSource:
     match_name: str
@@ -42,21 +51,45 @@ class VideoSource:
 def discover_video_sources(dataset_root: Path, matches: Optional[Iterable[str]] = None) -> Dict[str, VideoSource]:
     match_filter = set(matches) if matches is not None else None
     dataset_root = dataset_root.expanduser()
-    soccer_root = dataset_root / "SoccerNet"
+    
+    # Try to find SoccerNet root, otherwise assume dataset_root is it
+    search_root = dataset_root / "SoccerNet"
+    if not search_root.exists():
+        search_root = dataset_root
+
+    print(f"[INFO] Searching for videos in {search_root}")
     sources: Dict[str, VideoSource] = {}
 
-    if not soccer_root.exists():
-        return sources
+    # Search for match directories at different depths to handle various structures
+    # Depth 1: SoccerNet/Match (User's structure)
+    # Depth 2: SoccerNet/League/Match
+    # Depth 3: SoccerNet/League/Season/Match (Standard structure)
+    candidate_dirs = []
+    candidate_dirs.extend(search_root.glob("*"))
+    candidate_dirs.extend(search_root.glob("*/*"))
+    candidate_dirs.extend(search_root.glob("*/*/*"))
 
-    for match_path in soccer_root.glob("*/*/*"):
+    for match_path in candidate_dirs:
         if not match_path.is_dir():
             continue
+            
+        # Quick check if this directory contains video files
+        has_video = False
+        video_files = []
+        for ext in ["*.mkv", "*.mp4", "*.MKV", "*.MP4"]:
+            found = list(match_path.glob(ext))
+            if found:
+                has_video = True
+                video_files.extend(found)
+        
+        if not has_video:
+            continue
+
         match_name = canonical_match_name(match_path.name)
         if match_filter is not None and match_name not in match_filter:
             continue
-        for video_file in match_path.glob("*.*"):
-            if video_file.suffix.lower() not in {".mp4", ".mkv"}:
-                continue
+            
+        for video_file in video_files:
             stem = video_file.stem
             half = 1
             if stem.startswith("2") or "_2" in stem:
