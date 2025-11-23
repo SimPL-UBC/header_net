@@ -174,6 +174,12 @@ def resolve_metadata_path(cache_root: Path, row: Any) -> Optional[Path]:
     meta_value = getattr(row, "metadata", None)
     if isinstance(meta_value, str) and meta_value:
         meta_path = Path(meta_value)
+        if meta_path.is_absolute() and not meta_path.exists():
+             # Fallback to cache_root if absolute path is missing (e.g. different machine)
+             candidate = cache_root / meta_path.name
+             if candidate.exists():
+                 return candidate
+        
         if not meta_path.is_absolute():
             meta_path = cache_root / meta_path.name
         return meta_path
