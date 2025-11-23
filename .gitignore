@@ -1,5 +1,6 @@
 *.npy
 cache/pre_xgb/
+cache/cache_header/
 header_net/pre_xgb/
 dataset/
 RFDETR-Soccernet/
