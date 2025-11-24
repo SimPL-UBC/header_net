@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument("--lr_backbone", type=float, default=0.001, help="Learning rate for backbone")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--num_frames", type=int, default=11, help="Number of frames per clip")
     parser.add_argument("--gpus", type=int, nargs="+", help="GPU IDs")
     return parser.parse_args()
 

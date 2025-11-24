@@ -55,5 +55,6 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
     if hasattr(args, 'seed'): config.seed = args.seed
     if hasattr(args, 'output_root'): config.output_root = args.output_root
     if hasattr(args, 'gpus'): config.gpus = args.gpus
+    if hasattr(args, 'num_frames'): config.num_frames = args.num_frames
     
     return config
