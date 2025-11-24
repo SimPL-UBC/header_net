@@ -323,4 +323,4 @@ This markdown file does not contain executable code but is worth noting: it expl
 - `cache/cache_header/` — Output of Step 2; contains cropped samples, `train_cache_header.csv`, and `skipped_samples.csv` (frames dropped because no detections were available).
 - `cache/pre_xgb/` — Output of Step 3 (if used); contains trained XGBoost models, feature importances, proposals, and metadata.
 
-Follow the order: configure paths → build detections → create cache → (optionally) train the XGBoost prefilter → move on to the deep model (`train_header.py`). Whenever raw videos, detector weights, or labels change, rerun the necessary steps so the cache stays in sync.
+Follow the order: configure paths → build detections → create cache → (optionally) train the XGBoost prefilter → move on to the VideoMAE training entry point (`python -m training.cli_train_header`). Whenever raw videos, detector weights, or labels change, rerun the necessary steps so the cache stays in sync.

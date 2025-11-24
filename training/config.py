@@ -7,17 +7,17 @@ class Config:
     # Data
     train_csv: str
     val_csv: str
-    num_frames: int = 11
+    backbone_ckpt: str = "checkpoints/VideoMAEv2-Base"
+    num_frames: int = 16
     input_size: int = 224
     frame_sampling: str = "center"
+    num_classes: int = 2
 
     # Model
-    backbone: str = "csn"
-    finetune_mode: str = "full"
+    lr_head: float = 1e-3
 
     # Optimization
-    optimizer_type: str = "sgd"
-    lr_backbone: float = 0.001
+    optimizer_type: str = "adamw"
     weight_decay: float = 1e-4
     epochs: int = 50
     batch_size: int = 16
@@ -36,13 +36,13 @@ def build_config_from_args(args: Any) -> Config:
     return Config(
         train_csv=args.train_csv,
         val_csv=args.val_csv,
+        backbone_ckpt=args.backbone_ckpt,
         num_frames=getattr(args, "num_frames", Config.num_frames),
         input_size=getattr(args, "input_size", Config.input_size),
         frame_sampling=getattr(args, "frame_sampling", Config.frame_sampling),
-        backbone=args.backbone,
-        finetune_mode=args.finetune_mode,
+        num_classes=getattr(args, "num_classes", Config.num_classes),
+        lr_head=args.lr_head,
         optimizer_type=getattr(args, "optimizer_type", Config.optimizer_type),
-        lr_backbone=args.lr_backbone,
         weight_decay=args.weight_decay,
         epochs=args.epochs,
         batch_size=args.batch_size,

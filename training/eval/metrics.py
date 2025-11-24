@@ -22,13 +22,13 @@ def compute_classification_metrics(
         "val_auc": 0.0,
     }
     try:
-        metrics["val_acc"] = accuracy_score(labels, preds)
+        metrics["val_acc"] = float(accuracy_score(labels, preds))
         precision, recall, f1, _ = precision_recall_fscore_support(
             labels, preds, average="weighted", zero_division=0
         )
-        metrics["val_precision"] = precision
-        metrics["val_recall"] = recall
-        metrics["val_f1"] = f1
+        metrics["val_precision"] = float(precision)
+        metrics["val_recall"] = float(recall)
+        metrics["val_f1"] = float(f1)
 
         unique_labels = set(labels)
         if len(unique_labels) == 2:
@@ -38,7 +38,7 @@ def compute_classification_metrics(
                     pos_probs = probs_arr[:, 1]
                 else:
                     pos_probs = probs_arr
-                metrics["val_auc"] = roc_auc_score(labels, pos_probs)
+                metrics["val_auc"] = float(roc_auc_score(labels, pos_probs))
             except Exception as exc:  # AUC failures shouldn't break other metrics
                 logging.warning("Failed to compute AUC: %s", exc)
     except Exception as exc:

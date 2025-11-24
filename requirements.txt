@@ -1,5 +1,7 @@
 torch==2.8.0
 torchvision==0.23.0
+transformers==4.38.0
+timm==1.0.12
 numpy==2.2.6
 pandas==2.3.2
 scikit-learn==1.7.1
@@ -9,3 +11,5 @@ pyyaml==6.0.2
 pillow==11.3.0
 xgboost==3.0.5
 scipy==1.15.3
+easydict==1.13
+safetensors==0.4.5
