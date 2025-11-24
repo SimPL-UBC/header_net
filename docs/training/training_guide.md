@@ -67,3 +67,27 @@ python -m training.cli_train_header \
 
 - **Video Clips**: The model requires `.npy` files containing the video clips.
 - **Metadata**: The `.json` metadata files are **not** required for training. The training script reads labels and paths directly from the CSV.
+
+## 4. Multi-GPU Training
+
+The training script supports multi-GPU training on a single node using `torch.nn.DataParallel`.
+
+### Usage
+
+To use multiple GPUs, specify the GPU IDs with the `--gpus` argument.
+
+```bash
+conda activate deep_impact_env
+python -m training.cli_train_header \
+  --train_csv cache/header_net_16frames/train.csv \
+  --val_csv cache/header_net_16frames/val.csv \
+  --backbone csn \
+  --finetune_mode full \
+  --run_name csn_16frames_multi_gpu \
+  --epochs 50 \
+  --num_frames 16 \
+  --batch_size 32 \
+  --gpus 0 1 2 3
+```
+
+**Note**: When using multiple GPUs, you can typically increase the `batch_size`.
