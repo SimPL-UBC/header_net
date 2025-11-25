@@ -10,6 +10,7 @@ from ..config import Config
 
 class HeaderCacheDataset(Dataset):
     def __init__(self, csv_path, num_frames=11, input_size=224, transform=None, is_training=True):
+        self.csv_path = csv_path  # Store for path resolution
         self.df = pd.read_csv(csv_path)
         self.num_frames = num_frames
         self.input_size = input_size
@@ -24,27 +25,21 @@ class HeaderCacheDataset(Dataset):
         path = row['path']
         label = row['label']
         
-        # Load cache
-        # The path in CSV might be absolute or relative. 
-        # Assuming the cache file is at path + "_s.npy"
-        # Fix path if needed: if path starts with 'header_net/' and we are in 'header_net' (no nested header_net), strip it.
+        # Handle path resolution:
+        # The CSV may contain absolute paths from another machine
+        # Extract just the filename and look for it in the same directory as the CSV
         path_str = str(path)
-        if path_str.startswith("header_net/") and not os.path.exists("header_net"):
-            path_str = path_str.replace("header_net/", "", 1)
-            
-        cache_path = path_str + "_s.npy"
+        filename = os.path.basename(path_str)  # Get just the filename
+        
+        # Construct cache path in the same directory as the CSV
+        csv_dir = Path(self.csv_path).parent
+        cache_path = csv_dir / f"{filename}_s.npy"
         
         try:
-            # Load numpy array. Assuming shape (TotalFrames, H, W, C) or similar.
-            # Based on standard cache, it's likely (T, H, W, C) RGB.
+            # Load numpy array. Assuming shape (T, H, W, C) RGB.
             video_data = np.load(cache_path)
         except Exception as e:
             print(f"Error loading {cache_path}: {e}")
-            # Return a zero tensor or handle error. 
-            # For training stability, we might want to skip, but Dataset expects an item.
-            # We'll return zeros and a dummy label, but this is not ideal.
-            # Better to fail fast as per requirements for critical errors, 
-            # but for missing files during dev, maybe just raise.
             raise e
 
         total_frames = video_data.shape[0]
@@ -96,10 +91,16 @@ class HeaderCacheDataset(Dataset):
             
         return indices
 
-def get_transforms(input_size=224, is_training=True):
-    # Reuse CSN transforms: 224x224 resize, random flip, jitter, normalization
-    normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225])
+def get_transforms(input_size=224, is_training=True, backbone="csn"):
+    # Use backbone-specific normalization:
+    # - VideoMAE: mean/std = [0.5, 0.5, 0.5]
+    # - CSN: ImageNet mean/std
+    if backbone == "vmae":
+        normalize = T.Normalize(mean=[0.5, 0.5, 0.5],
+                                std=[0.5, 0.5, 0.5])
+    else:  # csn
+        normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225])
     
     if is_training:
         return T.Compose([
@@ -122,8 +123,8 @@ def get_transforms(input_size=224, is_training=True):
         ])
 
 def build_dataloaders(config: Config):
-    train_transform = get_transforms(config.input_size, is_training=True)
-    val_transform = get_transforms(config.input_size, is_training=False)
+    train_transform = get_transforms(config.input_size, is_training=True, backbone=config.backbone)
+    val_transform = get_transforms(config.input_size, is_training=False, backbone=config.backbone)
     
     train_dataset = HeaderCacheDataset(
         config.train_csv,

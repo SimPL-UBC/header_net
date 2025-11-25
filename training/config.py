@@ -12,12 +12,14 @@ class Config:
     frame_sampling: str = "center"  # Phase 1: only "center" supported
 
     # Model
-    backbone: str = "csn"  # Phase 1: only "csn"
-    finetune_mode: str = "full"  # Phase 1: only "full"
+    backbone: str = "csn"  # Phase 1: only "csn"; Phase 2: "csn" or "vmae"
+    finetune_mode: str = "full"  # Phase 1: only "full"; Phase 2: "full" or "frozen"
+    backbone_ckpt: Optional[str] = None  # Path to VideoMAE checkpoint
 
     # Optimization
     optimizer_type: str = "sgd"  # Phase 1: "sgd"
     lr_backbone: float = 0.001
+    lr_head: float = 1e-3  # Learning rate for VideoMAE head
     weight_decay: float = 1e-4
     epochs: int = 50
     batch_size: int = 16
@@ -42,9 +44,11 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
     # Model
     if hasattr(args, 'backbone'): config.backbone = args.backbone
     if hasattr(args, 'finetune_mode'): config.finetune_mode = args.finetune_mode
+    if hasattr(args, 'backbone_ckpt'): config.backbone_ckpt = args.backbone_ckpt
     
     # Optimization
     if hasattr(args, 'lr_backbone'): config.lr_backbone = args.lr_backbone
+    if hasattr(args, 'lr_head'): config.lr_head = args.lr_head
     if hasattr(args, 'weight_decay'): config.weight_decay = args.weight_decay
     if hasattr(args, 'epochs'): config.epochs = args.epochs
     if hasattr(args, 'batch_size'): config.batch_size = args.batch_size
