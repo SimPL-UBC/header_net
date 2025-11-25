@@ -3,6 +3,7 @@ cache/
 header_net/pre_xgb/
 dataset/
 RFDETR-Soccernet/
+visualizations/output/
 __pycache__/
 checkpoints/
 report/

@@ -87,14 +87,14 @@ def main():
     
     # Initialize metrics file
     with open(metrics_path, "w") as f:
-        f.write("epoch,train_loss,val_loss,val_acc,val_precision,val_recall,val_f1,val_auc,lr_backbone\n")
+        f.write("epoch,train_loss,train_f1,val_loss,val_acc,val_precision,val_recall,val_f1,val_auc,lr_backbone\n")
         
     for epoch in range(1, config.epochs + 1):
         print(f"Epoch {epoch}/{config.epochs}")
         
         # Train
         train_metrics = trainer.train_one_epoch(model, train_loader, optimizer, epoch)
-        print(f"Train Loss: {train_metrics['train_loss']:.4f} Acc: {train_metrics['train_acc']:.4f}")
+        print(f"Train Loss: {train_metrics['train_loss']:.4f} Acc: {train_metrics['train_acc']:.4f} F1: {train_metrics['train_f1']:.4f}")
         
         # Validate
         val_metrics, val_preds = trainer.validate(model, val_loader, epoch)
@@ -104,8 +104,8 @@ def main():
         current_lr = optimizer.param_groups[0]['lr']
         
         with open(metrics_path, "a") as f:
-            f.write(f"{epoch},{train_metrics['train_loss']:.6f},{val_metrics['val_loss']:.6f},"
-                    f"{val_metrics['val_acc']:.6f},{val_metrics['val_precision']:.6f},"
+            f.write(f"{epoch},{train_metrics['train_loss']:.6f},{train_metrics['train_f1']:.6f},"
+                    f"{val_metrics['val_loss']:.6f},{val_metrics['val_acc']:.6f},{val_metrics['val_precision']:.6f},"
                     f"{val_metrics['val_recall']:.6f},{val_metrics['val_f1']:.6f},"
                     f"{val_metrics['val_auc']:.6f},{current_lr:.6f}\n")
                     

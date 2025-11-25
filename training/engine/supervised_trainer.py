@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from sklearn.metrics import f1_score
 from ..eval.metrics import compute_classification_metrics
 
 class Trainer:
@@ -18,6 +19,8 @@ class Trainer:
         running_loss = 0.0
         correct = 0
         total = 0
+        all_preds = []
+        all_labels = []
         
         # train_loader yields (inputs, targets, meta)
         for i, (inputs, targets, _) in enumerate(train_loader):
@@ -34,11 +37,14 @@ class Trainer:
             _, predicted = torch.max(outputs, 1)
             total += targets.size(0)
             correct += (predicted == targets).sum().item()
+            all_preds.extend(predicted.detach().cpu().numpy())
+            all_labels.extend(targets.detach().cpu().numpy())
             
         epoch_loss = running_loss / total if total > 0 else 0.0
         epoch_acc = correct / total if total > 0 else 0.0
+        train_f1 = f1_score(all_labels, all_preds, zero_division=0) if total > 0 else 0.0
         
-        return {"train_loss": epoch_loss, "train_acc": epoch_acc}
+        return {"train_loss": epoch_loss, "train_acc": epoch_acc, "train_f1": train_f1}
 
     def validate(self, model, val_loader, epoch):
         model.eval()
