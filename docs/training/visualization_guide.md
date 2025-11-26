@@ -2,25 +2,9 @@
 
 After your VideoMAE training completes on the HPC cluster, follow these steps to generate all visualizations including Grad-CAM, embeddings, and error galleries.
 
-## Step 1: Activate the User Context
+## CLI-Only Usage (Recommended)
 
-The advanced visualizations require a `user_context.py` file. I've created a VideoMAE-specific template for you.
-
-**Option A: Rename the template (recommended)**
-```bash
-cd visualizations
-mv user_context_vmae.py user_context.py
-```
-
-**Option B: Keep both files**
-If you want to keep the original CSN context, you can modify `run_all.py` line 28 to:
-```python
-from . import user_context_vmae as user_context
-```
-
-## Step 2: Run All Visualizations
-
-Once your training completes, run this single command:
+You can now run all visualizations purely via CLI commands without creating any python context files.
 
 ```bash
 conda activate deep_impact_env
@@ -28,6 +12,7 @@ conda activate deep_impact_env
 python -m visualizations.run_all \
   --run-dir /scratch/st-lyndiacw-1/gyan/vmae_result/vmae_full_base \
   --save-dir /scratch/st-lyndiacw-1/gyan/vmae_result/vmae_full_base/visualizations \
+  --val-csv /scratch/st-lyndiacw-1/gyan/train_dataset/val.csv \
   --enable-gradcam \
   --enable-embedding \
   --enable-galleries \
@@ -39,11 +24,13 @@ python -m visualizations.run_all \
 
 - `--run-dir`: Directory containing your training outputs (metrics, predictions, config)
 - `--save-dir`: Where to save all visualization plots
+- `--val-csv`: Path to your validation CSV file (required for advanced visualizations)
 - `--enable-gradcam`: Generate Grad-CAM attention maps for sample videos
 - `--enable-embedding`: Generate 2D projection of learned representations (UMAP or t-SNE)
 - `--enable-galleries`: Generate galleries of correct predictions and errors
 - `--embedding-method`: Choose `umap` (faster, recommended) or `tsne`
 - `--no-show`: Don't display plots interactively (important for HPC)
+- `--max-samples`: Limit number of samples to load for galleries/Grad-CAM (default: 50)
 
 ## Generated Visualizations
 
@@ -80,7 +67,7 @@ Total: ~3-7 minutes for all visualizations
 ## Troubleshooting
 
 ### If Grad-CAM fails
-The user_context tries to identify the last transformer block automatically. If it fails, you'll see a warning but other visualizations will still generate.
+The script tries to identify the last transformer block automatically. If it fails, you'll see a warning but other visualizations will still generate.
 
 ### If embeddings are slow
 - Use `--embedding-method umap` instead of `tsne` (UMAP is faster)
@@ -88,23 +75,5 @@ The user_context tries to identify the last transformer block automatically. If 
 
 ### Out of memory errors
 If you get CUDA OOM during visualization:
-- Reduce batch size in `user_context_vmae.py` line 85 (currently set to 2)
-- Or run on CPU by setting `device = torch.device("cpu")` in line 97
-
-## Quick Start (Copy-Paste)
-
-After training completes, just run these two commands:
-
-```bash
-# 1. Activate user context
-mv visualizations/user_context_vmae.py visualizations/user_context.py
-
-# 2. Generate all visualizations
-python -m visualizations.run_all \
-  --run-dir /scratch/st-lyndiacw-1/gyan/vmae_result/vmae_full_base \
-  --save-dir /scratch/st-lyndiacw-1/gyan/vmae_result/vmae_full_base/visualizations \
-  --enable-gradcam --enable-embedding --enable-galleries \
-  --no-show
-```
-
-Done! All visualizations will be saved in `/scratch/st-lyndiacw-1/gyan/vmae_result/vmae_full_base/visualizations/`
+- The script defaults to batch size 2 for VideoMAE.
+- Or run on CPU by setting `CUDA_VISIBLE_DEVICES=""` before the command.

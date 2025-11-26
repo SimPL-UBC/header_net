@@ -21,13 +21,7 @@ from .utils import (
     load_epoch_metrics,
     load_predictions,
 )
-
-# Optional context file where you can define: model, device, gradcam_target_layer,
-# test_loader, test_videos_subset, y_true_subset, y_pred_proba_subset.
-try:
-    from . import user_context  # type: ignore
-except ImportError:
-    user_context = None
+from .context_manager import build_context
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,9 +29,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR, help="Path to run directory with metrics/predictions.")
     parser.add_argument("--save-dir", type=Path, default=None, help="Directory to save figures (optional).")
     parser.add_argument("--no-show", action="store_true", help="Do not call plt.show() at the end.")
-    parser.add_argument("--enable-gradcam", action="store_true", help="Run Grad-CAM visualizations (requires user_context).")
-    parser.add_argument("--enable-embedding", action="store_true", help="Run embedding visualization (requires user_context.test_loader).")
-    parser.add_argument("--enable-galleries", action="store_true", help="Run qualitative galleries (requires user_context test videos).")
+    parser.add_argument("--enable-gradcam", action="store_true", help="Run Grad-CAM visualizations.")
+    parser.add_argument("--enable-embedding", action="store_true", help="Run embedding visualization.")
+    parser.add_argument("--enable-galleries", action="store_true", help="Run qualitative galleries.")
+    
+    # Context arguments
+    parser.add_argument("--val-csv", type=Path, default=None, help="Path to validation CSV (overrides config).")
+    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Path to model checkpoint (overrides best_metrics.json).")
+    parser.add_argument("--max-samples", type=int, default=50, help="Max samples to load for galleries/Grad-CAM.")
+    
     parser.add_argument(
         "--feature-layer-name",
         type=str,
@@ -67,9 +67,11 @@ def main() -> None:
 
     apply_global_style()
 
+    # Load basic metrics (always available from run dir)
     metrics = load_epoch_metrics(run_dir)
     y_true, y_pred_proba, _ = load_predictions(run_dir)
 
+    # Generate standard plots
     plot_loss_curves(metrics["epochs"], metrics["train_loss"], metrics["val_loss"], save_path=maybe_save_path(save_dir, "loss") if save_dir else None)
     plot_f1_curves(metrics["epochs"], metrics["train_f1"], metrics["val_f1"], save_path=maybe_save_path(save_dir, "f1") if save_dir else None)
     plot_roc_curve(y_true, y_pred_proba, save_path=maybe_save_path(save_dir, "roc") if save_dir else None)
@@ -78,85 +80,78 @@ def main() -> None:
     plot_probability_distributions(y_true, y_pred_proba, save_path=maybe_save_path(save_dir, "probability_distributions") if save_dir else None)
     plot_confusion_matrix(y_true, y_pred_proba, class_names=CLASS_NAMES, threshold=0.5, save_path=maybe_save_path(save_dir, "confusion_matrix") if save_dir else None)
 
+    # Build context if advanced visualizations are requested
+    context = None
+    if args.enable_gradcam or args.enable_embedding or args.enable_galleries:
+        try:
+            print("Building visualization context...")
+            context = build_context(
+                run_dir=run_dir,
+                val_csv_path=args.val_csv,
+                checkpoint_path=args.checkpoint_path,
+                max_samples=args.max_samples
+            )
+        except Exception as e:
+            print(f"Failed to build context: {e}")
+            print("Skipping advanced visualizations.")
+
     # Optional: Grad-CAM on subset
     if args.enable_gradcam:
-        if user_context is None:
-            print("Grad-CAM skipped: create visualizations/user_context.py with model, gradcam_target_layer, test_videos_subset, y_true_subset, y_pred_proba_subset.")
+        if context is None:
+            print("Grad-CAM skipped: context build failed.")
+        elif context.gradcam_target_layer is None:
+            print("Grad-CAM skipped: could not determine target layer.")
         else:
-            model = getattr(user_context, "model", None)
-            gradcam_target_layer = getattr(user_context, "gradcam_target_layer", None)
-            videos = getattr(user_context, "test_videos_subset", None)
-            y_true_subset = getattr(user_context, "y_true_subset", None)
-            y_pred_proba_subset = getattr(user_context, "y_pred_proba_subset", None)
-            device = getattr(user_context, "device", None)
-            preprocess_fn = getattr(user_context, "preprocess_fn", None)
-            if model is None or gradcam_target_layer is None or videos is None or y_true_subset is None or y_pred_proba_subset is None:
-                print("Grad-CAM skipped: missing model/target layer or test subset in user_context.")
-            else:
-                gradcam = GradCAM3D(model, gradcam_target_layer)
-                demo_gradcam_on_subset(
-                    model,
-                    videos,
-                    y_true_subset,
-                    y_pred_proba_subset,
-                    CLASS_NAMES,
-                    gradcam,
-                    num_examples=3,
-                    device=device,
-                    preprocess_fn=preprocess_fn,
-                    save_dir=save_dir,
-                )
+            gradcam = GradCAM3D(context.model, context.gradcam_target_layer)
+            demo_gradcam_on_subset(
+                context.model,
+                context.test_videos_subset,
+                context.y_true_subset,
+                context.y_pred_proba_subset,
+                CLASS_NAMES,
+                gradcam,
+                num_examples=3,
+                device=context.device,
+                preprocess_fn=context.preprocess_fn,
+                save_dir=save_dir,
+            )
 
     # Optional: Embedding projection
     if args.enable_embedding:
-        if user_context is None:
-            print("Embedding visualization skipped: create visualizations/user_context.py with model and test_loader.")
+        if context is None:
+            print("Embedding visualization skipped: context build failed.")
         else:
-            model = getattr(user_context, "model", None)
-            test_loader = getattr(user_context, "test_loader", None)
-            device = getattr(user_context, "device", None)
-            if model is None or test_loader is None:
-                print("Embedding visualization skipped: missing model or test_loader in user_context.")
-            else:
-                device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                model.to(device)
-                features, labels, probs = extract_features(model, test_loader, device, feature_layer_name=args.feature_layer_name)
-                plot_embedding_2d(
-                    features,
-                    labels,
-                    probs,
-                    method=args.embedding_method,
-                    class_names=CLASS_NAMES,
-                    save_path=maybe_save_path(save_dir, "embedding") if save_dir else None,
-                )
+            features, labels, probs = extract_features(context.model, context.test_loader, context.device, feature_layer_name=args.feature_layer_name)
+            plot_embedding_2d(
+                features,
+                labels,
+                probs,
+                method=args.embedding_method,
+                class_names=CLASS_NAMES,
+                save_path=maybe_save_path(save_dir, "embedding") if save_dir else None,
+            )
 
     # Optional: qualitative galleries
     if args.enable_galleries:
-        if user_context is None:
-            print("Galleries skipped: create visualizations/user_context.py with test_videos_subset, y_true_subset, y_pred_proba_subset.")
+        if context is None:
+            print("Galleries skipped: context build failed.")
         else:
-            videos = getattr(user_context, "test_videos_subset", None)
-            y_true_subset = getattr(user_context, "y_true_subset", None)
-            y_pred_proba_subset = getattr(user_context, "y_pred_proba_subset", None)
-            if videos is None or y_true_subset is None or y_pred_proba_subset is None:
-                print("Galleries skipped: missing required arrays in user_context.")
-            else:
-                plot_error_gallery(
-                    videos,
-                    y_true_subset,
-                    y_pred_proba_subset,
-                    class_names=CLASS_NAMES,
-                    max_videos=8,
-                    save_path=maybe_save_path(save_dir, "error_gallery") if save_dir else None,
-                )
-                plot_correct_gallery(
-                    videos,
-                    y_true_subset,
-                    y_pred_proba_subset,
-                    class_names=CLASS_NAMES,
-                    max_videos=8,
-                    save_path=maybe_save_path(save_dir, "correct_gallery") if save_dir else None,
-                )
+            plot_error_gallery(
+                context.test_videos_subset,
+                context.y_true_subset,
+                context.y_pred_proba_subset,
+                class_names=CLASS_NAMES,
+                max_videos=8,
+                save_path=maybe_save_path(save_dir, "error_gallery") if save_dir else None,
+            )
+            plot_correct_gallery(
+                context.test_videos_subset,
+                context.y_true_subset,
+                context.y_pred_proba_subset,
+                class_names=CLASS_NAMES,
+                max_videos=8,
+                save_path=maybe_save_path(save_dir, "correct_gallery") if save_dir else None,
+            )
 
     if not args.no_show:
         plt.show()
