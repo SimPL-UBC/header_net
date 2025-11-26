@@ -187,8 +187,10 @@ def build_context(
     fallback = samples
     
     selected = correct_headers[: subset_size // 2] + misclassified[: subset_size // 2]
+    # Use IDs for filtering to avoid numpy array comparison issues
+    selected_ids = {s["id"] for s in selected}
     if len(selected) < subset_size:
-        remaining = [s for s in fallback if s not in selected]
+        remaining = [s for s in fallback if s["id"] not in selected_ids]
         selected.extend(remaining[: subset_size - len(selected)])
         
     test_videos_subset = [s["raw"] for s in selected]
