@@ -76,9 +76,56 @@ class GradCAM3D:
         if self.activations is None or self.gradients is None:
             raise RuntimeError("Grad-CAM hooks did not capture activations/gradients.")
 
-        # activations/gradients shape: (1, C, T, H, W)
-        weights = self.gradients.mean(dim=(2, 3, 4), keepdim=True)  # (1, C, 1, 1, 1)
-        cam = (weights * self.activations).sum(dim=1)  # (1, T, H, W)
+        # Handle different output shapes
+        # 3D CNN: (B, C, T, H, W)
+        # Transformer: (B, N, D) where N is tokens, D is embedding dim
+        
+        if self.gradients.ndim == 5:
+            # CNN case: (B, C, T, H, W)
+            # Average over spatial-temporal dims (2, 3, 4)
+            weights = self.gradients.mean(dim=(2, 3, 4), keepdim=True)  # (B, C, 1, 1, 1)
+            cam = (weights * self.activations).sum(dim=1)  # (B, T, H, W)
+            
+        elif self.gradients.ndim == 3:
+            # Transformer case: (B, N, D)
+            # Average over tokens (dim 1) to get weight per channel/embedding dim
+            weights = self.gradients.mean(dim=1, keepdim=True)  # (B, 1, D)
+            
+            # Weighted sum over embedding dim (dim 2)
+            cam = (weights * self.activations).sum(dim=2)  # (B, N)
+            
+            # Reshape N tokens back to (T', H', W')
+            # Infer dimensions from input_tensor (B, C, T, H, W)
+            # VideoMAE v2: tubelet=2, patch=16
+            B, _, T, H, W = input_tensor.shape
+            t_down = 2
+            h_down = 16
+            w_down = 16
+            
+            T_prime = T // t_down
+            H_prime = H // h_down
+            W_prime = W // w_down
+            
+            # Verify shape matches
+            if cam.shape[1] == T_prime * H_prime * W_prime:
+                cam = cam.reshape(B, T_prime, H_prime, W_prime)
+            else:
+                # Fallback: try to infer square spatial
+                # Assuming T_prime is 8 for 16 frames
+                N = cam.shape[1]
+                # Try T_prime = 8
+                if N % 8 == 0:
+                    HW = N // 8
+                    S = int(np.sqrt(HW))
+                    if S * S == HW:
+                        cam = cam.reshape(B, 8, S, S)
+                    else:
+                        raise ValueError(f"Could not reshape CAM with {N} tokens to spatial dimensions.")
+                else:
+                    raise ValueError(f"Could not reshape CAM with {N} tokens to spatial dimensions.")
+        else:
+            raise ValueError(f"Unsupported gradient shape: {self.gradients.shape}")
+
         cam = torch.relu(cam).squeeze(0)  # (T, H, W)
 
         cam_np = cam.cpu().numpy()
