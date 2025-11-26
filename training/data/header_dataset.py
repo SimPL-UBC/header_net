@@ -26,14 +26,20 @@ class HeaderCacheDataset(Dataset):
         label = row['label']
         
         # Handle path resolution:
-        # The CSV may contain absolute paths from another machine
-        # Extract just the filename and look for it in the same directory as the CSV
+        # Try absolute path from CSV first, then fall back to basename approach
         path_str = str(path)
-        filename = os.path.basename(path_str)  # Get just the filename
         
-        # Construct cache path in the same directory as the CSV
-        csv_dir = Path(self.csv_path).parent
-        cache_path = csv_dir / f"{filename}_s.npy"
+        # Option 1: Try absolute path from CSV with _s.npy suffix
+        cache_path_absolute = Path(f"{path_str}_s.npy")
+        
+        if cache_path_absolute.exists():
+            cache_path = cache_path_absolute
+        else:
+            # Option 2: Fall back to basename in CSV directory
+            # The CSV may contain absolute paths from another machine
+            filename = os.path.basename(path_str)
+            csv_dir = Path(self.csv_path).parent
+            cache_path = csv_dir / f"{filename}_s.npy"
         
         try:
             # Load numpy array. Assuming shape (T, H, W, C) RGB.
