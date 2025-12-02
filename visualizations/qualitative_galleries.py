@@ -31,7 +31,9 @@ def plot_video_gallery(
         return
 
     n_rows = len(indices)
-    fig, axes = plt.subplots(n_rows, num_frames_per_video, figsize=(num_frames_per_video * 3, n_rows * 2.6))
+    fig_width = num_frames_per_video * 4.5
+    fig_height = n_rows * 4.0
+    fig, axes = plt.subplots(n_rows, num_frames_per_video, figsize=(fig_width, fig_height))
     if n_rows == 1:
         axes = np.expand_dims(axes, axis=0)
 
@@ -42,24 +44,36 @@ def plot_video_gallery(
         frame_ids = sample_keyframes(frames, num_frames_per_video)
 
         true_label = class_names[y_true[idx]]
-        pred_label = class_names[int(y_pred_proba[idx] >= 0.5)]
-        prob = y_pred_proba[idx]
-        row_label = f"True: {true_label}\nPred: {pred_label}\np={prob:.2f}"
+        prob_header = float(y_pred_proba[idx])
+        pred_class = int(prob_header >= 0.5)
+        pred_label = class_names[pred_class]
+        pred_prob = prob_header if pred_class == 1 else 1 - prob_header
+        row_label = f"True: {true_label} | Pred: {pred_label} ({pred_prob*100:.1f}%)"
 
         for col, frame_idx in enumerate(frame_ids):
             ax = axes[row, col]
             ax.imshow(frames[frame_idx])
             ax.axis("off")
             if col == 0:
-                ax.set_ylabel(row_label, fontsize=10)
-            ax.set_title(f"t={frame_idx}", fontsize=9)
+                ax.text(
+                    -0.12,
+                    0.5,
+                    row_label,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="center",
+                    fontsize=14,
+                    fontweight="bold",
+                    wrap=True,
+                )
+            ax.set_title(f"t={frame_idx}", fontsize=12)
 
-    fig.suptitle(title)
-    plt.tight_layout()
+    fig.suptitle(title, fontsize=18)
+    fig.subplots_adjust(left=0.26, right=0.98, top=0.92, wspace=0.08, hspace=0.35)
     if save_path:
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(save_path, dpi=300)
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
 
 
 def plot_error_gallery(

@@ -1,69 +1,85 @@
-\documentclass[tikz]{standalone}
+\documentclass[tikz, border=1cm]{standalone}
 \usepackage{tikz}
-\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, calc}
 
 \begin{document}
 
 \begin{tikzpicture}[
-    node distance=1.5cm and 2cm,
-    process/.style={rectangle, rounded corners, minimum width=3cm, minimum height=1.2cm, text centered, text width=3cm, draw=black, fill=blue!20, thick},
-    data/.style={ellipse, minimum width=2.5cm, text centered, text width=2.5cm, draw=black, fill=green!20, thick},
-    model/.style={cylinder, shape border rotate=90, aspect=0.3, minimum height=2.5cm, minimum width=1.5cm, text centered, draw=black, fill=orange!30, thick},
-    final/.style={rectangle, rounded corners, minimum width=3cm, minimum height=1.2cm, text centered, text width=3cm, draw=black, fill=red!30, thick},
+    node distance=0.8cm and 0.8cm,
+    process/.style={rectangle, rounded corners, minimum width=2.8cm, minimum height=1.4cm, text centered, text width=2.6cm, draw=black, fill=blue!20, thick, font=\scriptsize},
+    data/.style={ellipse, minimum width=2.5cm, minimum height=1.2cm, text centered, text width=2.2cm, draw=black, fill=green!20, thick, font=\scriptsize},
+    model/.style={cylinder, shape border rotate=90, aspect=0.3, minimum height=2.0cm, minimum width=1.5cm, text centered, text width=1.4cm, draw=black, fill=orange!30, thick, font=\scriptsize},
+    final/.style={rectangle, rounded corners, minimum width=2.8cm, minimum height=1.4cm, text centered, text width=2.6cm, draw=black, fill=red!30, thick, font=\scriptsize},
     arrow/.style={-Latex, thick},
     dashed_arrow/.style={-Latex, thick, dashed},
-    % Style for the bounding box labels
-    stage_label/.style={font=\bfseries}
+    stage_label/.style={font=\bfseries\scriptsize, align=center}
 ]
 
-% STAGE 1: Data Input & Preprocessing
-\node (videos) [data] {Input Videos (SoccerNetV2, etc.)};
-\node (ball_det) [process, below=of videos] {1. Ball Detection and Tracking};
-\node (kinematics) [process, below left=1cm and 0.5cm of ball_det] {2a. Ball Kinematic Feature Extraction (velocity, accel, jerk)};
-\node (sampling) [process, below right=1cm and 0.5cm of ball_det] {2b. Temporal Windowing and Cropping};
+% --- Row 1: Top Level (Preprocessing) ---
+\node (videos) [data] {Input Videos};
+\node (ball_det) [process, right=of videos] {1. Ball Detection};
 
-% STAGE 2: Weak Prefilter (XGB)
-\node (pre_xgb) [model, below=of kinematics, yshift=-0.5cm] {Pre-XGB Model (Kinematics)};
-\node (candidates) [data, below=of pre_xgb, yshift=-0.5cm] {Candidate Frames (Pruned Negatives)};
+% Extra space for "Trajectory" label
+\node (kinematics) [process, right=2.5cm of ball_det] {2a. Kinematics\\(vel, acc)};
+\node (pre_xgb) [model, right=of kinematics] {Pre-XGB};
+\node (candidates) [data, right=of pre_xgb] {Candidates};
 
-% STAGE 3: Main Detection Model (CNN)
-\node (cnn_input) [data, below=of sampling, yshift=-0.5cm] {Spatio-Temporal Crops (11 frames x 3 channels)};
-\node (cnn_model) [model, below=of cnn_input, yshift=-0.5cm] {3D ResNet-CSN Model};
-\node (cnn_probs) [data, below=of cnn_model, yshift=-0.5cm] {Initial Header Probabilities};
+% --- Row 2: Windowing (Stepped Down) ---
+\node (sampling) [process, below=2cm of ball_det] {2b. Windowing};
+\node (cnn_input) [data, right=of sampling] {Crops (16x3)};
 
-% STAGE 4: Refinement (XGB)
-\node (temporal_feats) [process, below=of cnn_probs] {3. Temporal Feature Engineering (Prob. Window Stats)};
-\node (post_xgb) [model, below=of temporal_feats, yshift=-0.5cm] {Post-XGB Model (Temporal Probs)};
-\node (final_probs) [data, below=of post_xgb, yshift=-0.5cm] {Refined Header Probabilities};
+% --- Row 3: Core Detection (Stepped Down Again) ---
+% Increased spacing to 4.5cm to move Core Detection further down
+\node (cnn_model) [model, below=2cm of cnn_input] {CSN Model};
+\node (cnn_probs) [data, right=of cnn_model] {Init Probs};
+\node (temporal_feats) [process, right=of cnn_probs] {3. Temporal Feats};
 
-% STAGE 5: Final Event Detection
-\node (nms) [process, below=of final_probs] {4. Temporal NMS and Peak Finding};
-\node (output) [final, below=of nms] {Final Header Events};
+% --- Row 4: Refinement (Bottom) ---
+\node (post_xgb) [model, below=1cm of temporal_feats] {Post-XGB};
+\node (final_probs) [data, left=of post_xgb] {Refined Probs};
+\node (nms) [process, left=of final_probs] {4. NMS};
+\node (output) [final, left=of nms] {Final Events};
 
-% Arrows
+
+% --- Arrows ---
+
+% Row 1
 \draw [arrow] (videos) -- (ball_det);
-\draw [arrow] (ball_det) -- node[pos=0.5, above, sloped] {Ball Trajectory} (kinematics);
-\draw [arrow] (ball_det) -- (sampling);
-
+\draw [arrow] (ball_det) -- node[midway, above, font=\tiny] {Trajectory} (kinematics);
 \draw [arrow] (kinematics) -- (pre_xgb);
 \draw [arrow] (pre_xgb) -- (candidates);
-\draw [dashed_arrow] (candidates) -- node[pos=0.5, above, sloped] {Filter} (sampling);
 
+% Row 1 -> Row 2
+\draw [arrow] (ball_det) -- (sampling);
+\draw [dashed_arrow] (candidates) -- node[midway, above, sloped, font=\tiny] {Filter} (sampling);
+
+% Row 2 -> Row 3
 \draw [arrow] (sampling) -- (cnn_input);
-\draw [arrow] (cnn_input) -- (cnn_model);
+\draw [arrow] (cnn_input) -- (cnn_model); % Down step
 \draw [arrow] (cnn_model) -- (cnn_probs);
-
 \draw [arrow] (cnn_probs) -- (temporal_feats);
+
+% Pre-XGB -> Temporal Feats (Long connection)
+% Route: From Pre-XGB (Row 1) to Temporal Feats (Row 3)
+\draw [arrow, rounded corners] (pre_xgb.south) -- ++(0,-0.5) -| (temporal_feats.north);
+
+
+% Row 3 -> Row 4
 \draw [arrow] (temporal_feats) -- (post_xgb);
 \draw [arrow] (post_xgb) -- (final_probs);
-
 \draw [arrow] (final_probs) -- (nms);
 \draw [arrow] (nms) -- (output);
 
-% Bounding Boxes for conceptual stages
-\node[draw=blue!50, thick, rounded corners, inner ysep=1cm, inner xsep=0.5cm, fit=(ball_det) (kinematics) (sampling) (pre_xgb), label={[stage_label]above:Preprocessing and Candidate Generation}] {};
-\node[draw=orange!50, thick, rounded corners, inner ysep=0.5cm, fit=(cnn_model) (cnn_probs), label={[stage_label]above:Core Detection}] {};
-\node[draw=green!50, thick, rounded corners, inner ysep=0.5cm, fit=(temporal_feats) (post_xgb) (nms), label={[stage_label]above:Refinement and Post-processing}] {};
+
+% --- Bounding Boxes ---
+\node[draw=blue!50, thick, rounded corners, inner sep=0.3cm, fit=(ball_det) (kinematics) (pre_xgb) (candidates) (sampling), label={[stage_label]above:Preprocessing}] {};
+
+% Core Detection (Inner Box)
+\node[draw=orange!50, thick, rounded corners, inner sep=0.3cm, fit=(cnn_model) (cnn_probs), label={[stage_label]above:Core Detection}] {};
+
+% Refinement (Outer Box - Enclosing Core Detection)
+% Includes Core Detection nodes + Refinement nodes
+\node[draw=green!50, thick, rounded corners, inner sep=0.8cm, fit=(cnn_model) (cnn_probs) (temporal_feats) (post_xgb) (nms), label={[stage_label]above:Refinement}] {};
 
 \end{tikzpicture}
 

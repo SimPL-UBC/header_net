@@ -21,8 +21,8 @@ def plot_confusion_matrix(
     cm = confusion_matrix(y_true, preds, labels=[0, 1])
     cm_percent = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1e-9)
 
-    fig, ax = plt.subplots()
-    im = ax.imshow(cm, cmap="Blues")
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(cm, cmap="YlGnBu")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     ax.set_xticks([0, 1])
@@ -34,17 +34,20 @@ def plot_confusion_matrix(
     ax.set_title(f"Confusion Matrix at Threshold {threshold}")
 
     # Annotate counts and row percentages.
+    text_contrast_threshold = cm.max() * 0.45 if cm.max() > 0 else 0
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
+            cell_value = cm[i, j]
+            text_color = "white" if cell_value > text_contrast_threshold else "black"
             ax.text(
                 j,
                 i,
-                f"{cm[i, j]}\n{cm_percent[i, j] * 100:.1f}%",
+                f"{cell_value}\n{cm_percent[i, j] * 100:.1f}%",
                 ha="center",
                 va="center",
-                color="black",
-                fontsize=10,
-            )
+                color=text_color,
+                fontsize=13,
+                )
 
     plt.tight_layout()
     if save_path:

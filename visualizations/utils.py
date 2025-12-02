@@ -101,12 +101,13 @@ def apply_global_style() -> None:
         {
             "axes.grid": True,
             "grid.alpha": 0.3,
-            "figure.figsize": (8, 5),
-            "axes.titlesize": 13,
-            "axes.labelsize": 12,
-            "legend.fontsize": 10,
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 10,
+            "figure.figsize": (10, 6),
+            "axes.titlesize": 18,
+            "axes.labelsize": 16,
+            "legend.fontsize": 14,
+            "xtick.labelsize": 13,
+            "ytick.labelsize": 13,
+            "font.size": 13,
         }
     )
 

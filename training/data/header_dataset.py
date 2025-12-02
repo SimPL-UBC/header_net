@@ -114,10 +114,8 @@ def get_transforms(input_size=224, is_training=True, backbone="csn"):
             # "224x224 resize" - usually implies resizing to input_size directly or RandomResizedCrop
             # Given "reuse CSN transforms", and typical video classification:
             # Often: Resize(256), RandomCrop(224) or RandomResizedCrop(224).
-            # I will use Resize((input_size, input_size)) + RandomHorizontalFlip + ColorJitter as requested.
-            # "random flip, jitter"
+            # Apply only horizontal flip for augmentation; color jitter intentionally omitted.
             T.RandomHorizontalFlip(),
-            T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1), # Light jitter
             T.ToTensor(),
             normalize
         ])
