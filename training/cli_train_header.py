@@ -12,21 +12,23 @@ from .data.header_dataset import build_dataloaders
 from .models.factory import build_model
 from .engine.supervised_trainer import Trainer
 from .eval.predictions import save_predictions
+from .eval.plots import generate_all_plots
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Header Net Training Phase 1")
     parser.add_argument("--train_csv", required=True, help="Path to training CSV")
     parser.add_argument("--val_csv", required=True, help="Path to validation CSV")
     parser.add_argument("--backbone", default="csn", choices=["csn", "vmae"], help="Backbone model: csn or vmae")
-    parser.add_argument("--finetune_mode", default="full", choices=["full", "frozen"], help="Finetune mode: full or frozen")
+    parser.add_argument("--finetune_mode", default="full", choices=["full", "frozen", "partial"], help="Finetune mode: full, frozen, or partial")
+    parser.add_argument("--unfreeze_blocks", type=int, default=4, help="Number of last VideoMAE blocks to unfreeze in partial mode")
     parser.add_argument("--backbone_ckpt", default=None, help="Path to VideoMAE checkpoint directory")
     parser.add_argument("--run_name", required=True, help="Run name")
     parser.add_argument("--output_root", default="report/header_experiments", help="Output root directory")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of workers")
-    parser.add_argument("--lr_backbone", type=float, default=0.001, help="Learning rate for backbone")
-    parser.add_argument("--lr_head", type=float, default=1e-3, help="Learning rate for VideoMAE head")
+    parser.add_argument("--lr_backbone", type=float, default=1e-4, help="Learning rate for backbone")
+    parser.add_argument("--lr_head", type=float, default=1e-3, help="Learning rate for head")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num_frames", type=int, default=11, help="Number of frames per clip")
@@ -87,9 +89,15 @@ def main():
     
     best_f1 = -1.0
     
+    def get_group_lr(optimizer, group_name):
+        for group in optimizer.param_groups:
+            if group.get("name") == group_name:
+                return group.get("lr")
+        return None
+
     # Initialize metrics file
     with open(metrics_path, "w") as f:
-        f.write("epoch,train_loss,train_f1,val_loss,val_acc,val_precision,val_recall,val_f1,val_auc,lr_backbone\n")
+        f.write("epoch,train_loss,val_loss,val_acc,val_precision,val_recall,val_f1,val_auc,lr_backbone,lr_head\n")
         
     for epoch in range(1, config.epochs + 1):
         print(f"Epoch {epoch}/{config.epochs}")
@@ -103,13 +111,18 @@ def main():
         print(f"Val Loss: {val_metrics['val_loss']:.4f} F1: {val_metrics['val_f1']:.4f}")
         
         # Save metrics
-        current_lr = optimizer.param_groups[0]['lr']
+        lr_backbone = get_group_lr(optimizer, "backbone")
+        lr_head = get_group_lr(optimizer, "head")
+        if lr_backbone is None:
+            lr_backbone = config.lr_backbone
+        if lr_head is None:
+            lr_head = 0.0
         
         with open(metrics_path, "a") as f:
-            f.write(f"{epoch},{train_metrics['train_loss']:.6f},{train_metrics['train_f1']:.6f},"
+            f.write(f"{epoch},{train_metrics['train_loss']:.6f},"
                     f"{val_metrics['val_loss']:.6f},{val_metrics['val_acc']:.6f},{val_metrics['val_precision']:.6f},"
                     f"{val_metrics['val_recall']:.6f},{val_metrics['val_f1']:.6f},"
-                    f"{val_metrics['val_auc']:.6f},{current_lr:.6f}\n")
+                    f"{val_metrics['val_auc']:.6f},{lr_backbone:.6f},{lr_head:.6f}\n")
                     
         # Check best
         if val_metrics['val_f1'] > best_f1:
@@ -143,6 +156,10 @@ def main():
                 'optimizer_state': optimizer.state_dict(),
                 'config': vars(args)
             }, checkpoint_path)
+
+    plots_dir = run_dir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+    generate_all_plots(run_dir, metrics_path, predictions_path)
             
 if __name__ == "__main__":
     main()

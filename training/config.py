@@ -13,7 +13,8 @@ class Config:
 
     # Model
     backbone: str = "csn"  # Phase 1: only "csn"; Phase 2: "csn" or "vmae"
-    finetune_mode: str = "full"  # Phase 1: only "full"; Phase 2: "full" or "frozen"
+    finetune_mode: str = "full"  # Phase 1: only "full"; Phase 2: "full" or "frozen"; Phase 3: add "partial"
+    unfreeze_blocks: int = 4  # Number of last transformer blocks to unfreeze for VideoMAE partial fine-tuning
     backbone_ckpt: Optional[str] = None  # Path to VideoMAE checkpoint
 
     # Optimization
@@ -44,6 +45,7 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
     # Model
     if hasattr(args, 'backbone'): config.backbone = args.backbone
     if hasattr(args, 'finetune_mode'): config.finetune_mode = args.finetune_mode
+    if hasattr(args, 'unfreeze_blocks'): config.unfreeze_blocks = args.unfreeze_blocks
     if hasattr(args, 'backbone_ckpt'): config.backbone_ckpt = args.backbone_ckpt
     
     # Optimization

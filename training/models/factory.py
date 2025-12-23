@@ -18,6 +18,32 @@ class VideoMAEModel(nn.Module):
         return logits
 
 
+def _get_vmae_blocks(backbone):
+    vmae = backbone.vmae if hasattr(backbone, "vmae") else backbone
+
+    if hasattr(vmae, "blocks"):
+        return vmae.blocks
+
+    if hasattr(vmae, "encoder"):
+        encoder = vmae.encoder
+        if hasattr(encoder, "blocks"):
+            return encoder.blocks
+        if hasattr(encoder, "layers"):
+            return encoder.layers
+
+    if hasattr(vmae, "transformer"):
+        transformer = vmae.transformer
+        if hasattr(transformer, "blocks"):
+            return transformer.blocks
+        if hasattr(transformer, "layers"):
+            return transformer.layers
+
+    if hasattr(vmae, "model") and hasattr(vmae.model, "blocks"):
+        return vmae.model.blocks
+
+    raise ValueError("Unable to locate transformer blocks on the VideoMAE backbone.")
+
+
 def build_model(config: Config):
     """
     Builds the model and parameter groups based on configuration.
@@ -28,7 +54,7 @@ def build_model(config: Config):
         
         model = build_csn_backbone(config)
         param_groups = [
-            {'params': model.parameters(), 'lr': config.lr_backbone}
+            {'params': model.parameters(), 'lr': config.lr_backbone, 'name': 'backbone'}
         ]
         
     elif config.backbone == "vmae":
@@ -52,15 +78,47 @@ def build_model(config: Config):
             
             # Only train the head
             param_groups = [
-                {'params': head.parameters(), 'lr': config.lr_head}
+                {'params': head.parameters(), 'lr': config.lr_head, 'name': 'head'}
             ]
             print(f"VideoMAE backbone frozen. Training only head with lr={config.lr_head}")
             
+        elif config.finetune_mode == "partial":
+            if config.unfreeze_blocks < 0:
+                raise ValueError("unfreeze_blocks must be >= 0 for partial fine-tuning.")
+
+            # Freeze all backbone parameters first
+            for param in backbone.parameters():
+                param.requires_grad = False
+
+            blocks = list(_get_vmae_blocks(backbone))
+            num_blocks = len(blocks)
+            num_unfreeze = min(config.unfreeze_blocks, num_blocks)
+
+            if num_unfreeze > 0:
+                for block in blocks[-num_unfreeze:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+
+            backbone_params = [p for p in backbone.parameters() if p.requires_grad]
+            param_groups = []
+            if backbone_params:
+                param_groups.append(
+                    {'params': backbone_params, 'lr': config.lr_backbone, 'name': 'backbone'}
+                )
+            param_groups.append({'params': head.parameters(), 'lr': config.lr_head, 'name': 'head'})
+            print(
+                "VideoMAE partial fine-tuning: "
+                f"unfreeze_blocks={num_unfreeze}/{num_blocks}, "
+                f"backbone lr={config.lr_backbone}, head lr={config.lr_head}"
+            )
+
         elif config.finetune_mode == "full":
             # Train both backbone and head (Phase 3)
+            for param in backbone.parameters():
+                param.requires_grad = True
             param_groups = [
-                {'params': backbone.parameters(), 'lr': config.lr_backbone},
-                {'params': head.parameters(), 'lr': config.lr_head}
+                {'params': backbone.parameters(), 'lr': config.lr_backbone, 'name': 'backbone'},
+                {'params': head.parameters(), 'lr': config.lr_head, 'name': 'head'}
             ]
             print(f"VideoMAE full fine-tuning: backbone lr={config.lr_backbone}, head lr={config.lr_head}")
         else:
