@@ -2,6 +2,39 @@
 
 This guide explains how to prepare the dataset and train the Header Net model with either CSN or VideoMAE v2 backbones.
 
+## Pipeline Overview
+
+The full header detection pipeline consists of three stages:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    Header Detection Pipeline                          │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  Stage 1: Pre-filter XGBoost                                         │
+│  ─────────────────────────────                                       │
+│  • Uses ball kinematics + player spatial features (36 features)      │
+│  • Filters out easy negatives before CNN                             │
+│  • Reduces computational cost significantly                           │
+│                                                                       │
+│  Stage 2: 3D CNN (CSN or VideoMAE)                                   │
+│  ─────────────────────────────────                                   │
+│  • Visual feature extraction from video clips                        │
+│  • Per-clip binary classification (header vs non-header)             │
+│                                                                       │
+│  Stage 3: Post-filter XGBoost                                        │
+│  ──────────────────────────────                                      │
+│  • Temporal smoothing using 31-frame window                          │
+│  • Suppresses spurious detections                                    │
+│  • Learns characteristic probability patterns of true headers        │
+│                                                                       │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+For full details on XGBoost models, see [XGBoost Filters Guide](../xgboost_filters.md).
+
+---
+
 ## 1. Dataset Preparation
 
 The training script expects a split dataset (train and validation CSVs) with relative paths to the video clips (`.npy` files).
@@ -174,3 +207,173 @@ All training runs save the following artifacts to `report/header_experiments/<ru
 | VideoMAE | Full | 1e-5 to 1e-4 | 1e-3 |
 
 **Tip**: When fine-tuning VideoMAE, use a much lower learning rate for the backbone (1e-5) than the head (1e-3) to preserve pretrained features.
+
+---
+
+## 8. Full Pipeline Training
+
+This section describes how to train the complete pipeline including XGBoost pre-filter and post-filter.
+
+### Step 1: Train Pre-filter XGBoost
+
+The pre-filter uses ball kinematics and player spatial features to identify candidate frames:
+
+```bash
+conda activate deep_impact_env
+
+# Train pre-filter with player features (36 features)
+python tree/pre_xgb.py \
+    --metadata_dir scratch_output/generate_dataset_test/16_frames_ver/dataset_generation \
+    --output_dir cache/pre_xgb_full \
+    --neg_ratio 3.0 \
+    --n_folds 5
+```
+
+**Output**: `cache/pre_xgb_full/pre_xgb_final.pkl`
+
+### Step 2: Train 3D CNN
+
+Train the CNN model using CSN or VideoMAE backbone:
+
+```bash
+conda activate deep_impact_env
+
+# Option A: CSN backbone
+python -m training.cli_train_header \
+    --train_csv cache/header_net_16frames/train.csv \
+    --val_csv cache/header_net_16frames/val.csv \
+    --backbone csn \
+    --finetune_mode full \
+    --run_name csn_full_pipeline \
+    --epochs 50 \
+    --num_frames 16 \
+    --batch_size 16
+
+# Option B: VideoMAE backbone
+python -m training.cli_train_header \
+    --train_csv cache/header_net_16frames/train.csv \
+    --val_csv cache/header_net_16frames/val.csv \
+    --backbone vmae \
+    --finetune_mode full \
+    --backbone_ckpt checkpoints/VideoMAEv2-Base \
+    --run_name vmae_full_pipeline \
+    --epochs 30 \
+    --num_frames 16 \
+    --batch_size 2
+```
+
+**Output**: `report/header_experiments/<run_name>/checkpoints/best_epoch_*.pt`
+
+### Step 3: Export CNN Probabilities
+
+Run inference to export per-frame probabilities:
+
+```bash
+conda activate deep_impact_env
+
+python export_probs.py \
+    --model_path report/header_experiments/<run_name>/checkpoints/best_epoch_*.pt \
+    --data_csv cache/header_net_16frames/val.csv \
+    --output_csv cache/cnn_probabilities.csv \
+    --pre_xgb_model cache/pre_xgb_full/pre_xgb_final.pkl
+```
+
+**Output**: `cache/cnn_probabilities.csv` with columns: `video_id`, `frame_id`, `cnn_prob`, `ensemble_prob`, `pre_xgb_prob`
+
+### Step 4: Train Post-filter XGBoost
+
+The post-filter learns temporal patterns to refine CNN predictions:
+
+```bash
+conda activate deep_impact_env
+
+python tree/post_xgb.py \
+    --probs_csv cache/cnn_probabilities.csv \
+    --dataset_path ../DeepImpact \
+    --output_dir cache/post_xgb \
+    --window_size 15 \
+    --n_folds 5
+```
+
+**Output**: `cache/post_xgb/post_xgb_final.pkl`
+
+### Pipeline Summary
+
+| Stage | Script | Input | Output |
+|-------|--------|-------|--------|
+| Pre-filter | `tree/pre_xgb.py` | Metadata JSONs | `pre_xgb_final.pkl` |
+| CNN Training | `training.cli_train_header` | Train/Val CSVs | Model checkpoint |
+| Prob Export | `export_probs.py` | Model + Data | Probabilities CSV |
+| Post-filter | `tree/post_xgb.py` | Probabilities CSV | `post_xgb_final.pkl` |
+
+---
+
+## 9. Inference with Full Pipeline
+
+To run inference with all three stages:
+
+```bash
+conda activate deep_impact_env
+
+# Step 1: Run pre-filter on new data
+python tree/pre_xgb.py \
+    --metadata_dir /path/to/new_data \
+    --inference_only \
+    --model_path cache/pre_xgb_full/pre_xgb_final.pkl \
+    --output cache/proposals.csv
+
+# Step 2: Run CNN inference (via export_probs.py)
+python export_probs.py \
+    --model_path report/header_experiments/<run_name>/checkpoints/best_epoch_*.pt \
+    --data_csv cache/proposals.csv \
+    --output_csv cache/cnn_probs_inference.csv \
+    --pre_xgb_model cache/pre_xgb_full/pre_xgb_final.pkl
+
+# Step 3: Run post-filter
+python tree/post_xgb.py \
+    --probs_csv cache/cnn_probs_inference.csv \
+    --inference_only \
+    --model_path cache/post_xgb/post_xgb_final.pkl \
+    --output_dir cache/final_predictions
+```
+
+**Final Output**: `cache/final_predictions/final_predictions.csv`
+
+---
+
+## 10. Quick Start: End-to-End Training
+
+For a quick end-to-end training run on a small dataset:
+
+```bash
+conda activate deep_impact_env
+
+# 1. Prepare dataset
+python tools/split_dataset.py \
+    --input_csv scratch_output/generate_dataset_test/16_frames_ver/dataset_generation/train_cache_header.csv \
+    --output_dir cache/header_net_16frames \
+    --root_dir scratch_output/generate_dataset_test/16_frames_ver/dataset_generation
+
+# 2. Train pre-filter XGBoost
+python tree/pre_xgb.py \
+    --metadata_dir scratch_output/generate_dataset_test/16_frames_ver/dataset_generation \
+    --output_dir cache/pre_xgb_full \
+    --neg_ratio 3.0
+
+# 3. Train CNN (CSN for faster training)
+python -m training.cli_train_header \
+    --train_csv cache/header_net_16frames/train.csv \
+    --val_csv cache/header_net_16frames/val.csv \
+    --backbone csn \
+    --finetune_mode full \
+    --run_name quick_test \
+    --epochs 10 \
+    --batch_size 8
+
+# 4. Visualize results
+python -m visualizations.run_all \
+    --run-dir report/header_experiments/quick_test \
+    --save-dir report/header_experiments/quick_test/visualizations \
+    --val-csv cache/header_net_16frames/val.csv \
+    --no-show
+```

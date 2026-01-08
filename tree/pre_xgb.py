@@ -2,9 +2,14 @@
 """
 Weak XGB prefilter for header detection
 Computes ball kinematics features and trains XGB to prune easy negatives
+
+Features include:
+- Ball kinematics: position, velocity, acceleration, jerk, curvature
+- Player spatial context: distance to nearest player/head, player density
 """
 
 import sys
+import json
 import numpy as np
 import pandas as pd
 import cv2
@@ -23,6 +28,11 @@ if str(HEADER_NET_ROOT) not in sys.path:
 from configs import header_default as cfg
 from utils.detections import load_ball_det_dict, make_video_key
 from utils.labels import load_header_labels, build_half_frame_lookup
+from utils.player_features import (
+    compute_player_features,
+    extract_player_features_from_frame_data,
+    PLAYER_FEATURE_NAMES
+)
 
 def compute_kinematics_features(ball_positions, fps=25):
     """
@@ -181,8 +191,237 @@ def extract_features_from_video(video_id, ball_det_dict, fps=25):
     return features
 
 
+def extract_features_from_metadata_json(json_path, fps=25, use_player_features=True):
+    """
+    Extract kinematic AND player features from a metadata JSON file.
+
+    Args:
+        json_path: Path to *_meta.json file
+        fps: Video frame rate
+        use_player_features: Whether to include player-based features
+
+    Returns:
+        Tuple of (features_dict, sample_info) where:
+        - features_dict: Dict mapping frame_id -> feature dict
+        - sample_info: Dict with video_id, half, center_frame, label
+    """
+    with open(json_path, 'r') as f:
+        meta = json.load(f)
+
+    video_id = meta.get('video_id', '')
+    half = meta.get('half', 1)
+    center_frame = meta.get('frame', 0)
+    label = meta.get('label', 0)
+    frames_data = meta.get('frames', [])
+
+    if not frames_data:
+        return {}, {}
+
+    sample_info = {
+        'video_id': f"{video_id}_half{half}",
+        'half': half,
+        'center_frame': center_frame,
+        'label': label
+    }
+
+    # Sort frames by offset to ensure temporal order
+    frames_data = sorted(frames_data, key=lambda x: x.get('offset', 0))
+
+    # First pass: collect ball positions for kinematic feature computation
+    ball_positions = []
+    frame_to_data = {}
+
+    for frame_entry in frames_data:
+        offset = frame_entry.get('offset', 0)
+        frame_id = frame_entry.get('frame', center_frame + offset)
+        ball_data = frame_entry.get('ball', {})
+
+        if ball_data and 'box' in ball_data:
+            box = ball_data['box']
+            conf = ball_data.get('confidence', 0)
+            ball_positions.append((frame_id, box[0], box[1], box[2], box[3], conf))
+
+        frame_to_data[frame_id] = frame_entry
+
+    if len(ball_positions) < 3:
+        return {}, sample_info
+
+    # Compute kinematic features
+    features = compute_kinematics_features(ball_positions, fps)
+
+    # Add temporal features
+    features = add_temporal_features(features, window=5)
+
+    # Second pass: add player features if enabled
+    if use_player_features:
+        frame_ids = sorted(frame_to_data.keys())
+        for i, frame_id in enumerate(frame_ids):
+            if frame_id not in features:
+                continue
+
+            frame_entry = frame_to_data[frame_id]
+
+            # Get previous frame for velocity estimation
+            prev_frame_data = None
+            if i > 0:
+                prev_frame_id = frame_ids[i - 1]
+                prev_frame_data = frame_to_data.get(prev_frame_id)
+
+            # Extract player features
+            player_feats = extract_player_features_from_frame_data(
+                frame_entry, prev_frame_data
+            )
+
+            # Merge player features into kinematic features
+            features[frame_id].update(player_feats)
+
+    return features, sample_info
+
+
+def load_metadata_from_directory(metadata_dir, use_player_features=True):
+    """
+    Load all metadata JSON files from a directory.
+
+    Args:
+        metadata_dir: Directory containing *_meta.json files
+        use_player_features: Whether to include player-based features
+
+    Returns:
+        Tuple of (all_features, all_samples) where:
+        - all_features: Dict mapping (video_id, frame_id) -> feature dict
+        - all_samples: List of sample info dicts with labels
+    """
+    metadata_dir = Path(metadata_dir)
+    json_files = list(metadata_dir.glob('*_meta.json'))
+
+    print(f"Found {len(json_files)} metadata JSON files in {metadata_dir}")
+
+    all_features = {}
+    all_samples = []
+
+    for json_path in tqdm(json_files, desc="Loading metadata"):
+        features, sample_info = extract_features_from_metadata_json(
+            json_path, use_player_features=use_player_features
+        )
+
+        if not features or not sample_info:
+            continue
+
+        video_id = sample_info['video_id']
+        center_frame = sample_info['center_frame']
+        label = sample_info['label']
+
+        # Store features keyed by (video_id, frame_id)
+        for frame_id, feat_dict in features.items():
+            all_features[(video_id, frame_id)] = feat_dict
+
+        # Store sample info
+        all_samples.append({
+            'video_id': video_id,
+            'frame_id': center_frame,
+            'label': label,
+            'json_path': str(json_path)
+        })
+
+    print(f"Loaded {len(all_samples)} samples with {len(all_features)} frame features")
+
+    return all_features, all_samples
+
+
+# Feature names including player features
+KINEMATIC_FEATURE_NAMES = [
+    'x', 'y', 'vx', 'vy', 'speed', 'ax', 'ay', 'accel_mag',
+    'angle_change', 'speed_change', 'speed_drop_ratio', 'curvature', 'jerk',
+    'confidence', 'ball_size',
+    'speed_mean_w', 'speed_std_w', 'speed_max_w',
+    'accel_mean_w', 'accel_std_w', 'accel_max_w',
+    'angle_mean_w', 'angle_std_w', 'angle_max_w'
+]
+
+FULL_FEATURE_NAMES = KINEMATIC_FEATURE_NAMES + PLAYER_FEATURE_NAMES
+
+
+def create_training_data_from_metadata(
+    all_features, all_samples, use_player_features=True, neg_sampling_ratio=3.0
+):
+    """
+    Create training dataset from metadata-extracted features.
+
+    Args:
+        all_features: Dict mapping (video_id, frame_id) -> feature dict
+        all_samples: List of sample info dicts
+        use_player_features: Whether to include player features
+        neg_sampling_ratio: Ratio of negative to positive samples
+
+    Returns:
+        Tuple of (X, y, metadata, feature_names)
+    """
+    feature_names = FULL_FEATURE_NAMES if use_player_features else KINEMATIC_FEATURE_NAMES
+
+    X = []
+    y = []
+    metadata = []
+
+    # Separate positive and negative samples
+    positive_samples = [s for s in all_samples if s['label'] == 1]
+    negative_samples = [s for s in all_samples if s['label'] == 0]
+
+    print(f"Total samples: {len(all_samples)}")
+    print(f"Positive samples: {len(positive_samples)}")
+    print(f"Negative samples: {len(negative_samples)}")
+
+    # Process positive samples
+    for sample in positive_samples:
+        video_id = sample['video_id']
+        frame_id = sample['frame_id']
+        key = (video_id, frame_id)
+
+        if key in all_features:
+            feat_dict = all_features[key]
+            feat_vector = [feat_dict.get(fn, 0.0) for fn in feature_names]
+            X.append(feat_vector)
+            y.append(1)
+            metadata.append({
+                'video_id': video_id,
+                'frame_id': frame_id,
+                'label': 'header'
+            })
+
+    # Sample negatives
+    n_negatives = min(len(negative_samples), int(len(positive_samples) * neg_sampling_ratio))
+    rng = np.random.default_rng(2024)
+    sampled_negatives = rng.choice(len(negative_samples), n_negatives, replace=False)
+
+    for idx in sampled_negatives:
+        sample = negative_samples[idx]
+        video_id = sample['video_id']
+        frame_id = sample['frame_id']
+        key = (video_id, frame_id)
+
+        if key in all_features:
+            feat_dict = all_features[key]
+            feat_vector = [feat_dict.get(fn, 0.0) for fn in feature_names]
+            X.append(feat_vector)
+            y.append(0)
+            metadata.append({
+                'video_id': video_id,
+                'frame_id': frame_id,
+                'label': 'background'
+            })
+
+    X = np.array(X)
+    y = np.array(y)
+
+    print(f"Created training data: {len(y)} samples")
+    if len(y) > 0:
+        print(f"Positive samples: {np.sum(y)} ({np.mean(y)*100:.1f}%)")
+        print(f"Negative samples: {len(y) - np.sum(y)} ({(1-np.mean(y))*100:.1f}%)")
+
+    return X, y, metadata, feature_names
+
+
 def create_training_data(ball_det_dict, labels_df, neg_sampling_ratio=3.0):
-    """Create training dataset with features and labels"""
+    """Create training dataset with features and labels (kinematic features only)"""
     feature_names = [
         'x', 'y', 'vx', 'vy', 'speed', 'ax', 'ay', 'accel_mag',
         'angle_change', 'speed_change', 'speed_drop_ratio', 'curvature', 'jerk',
@@ -362,12 +601,26 @@ def generate_proposals(ball_det_dict, model, feature_names, threshold=0.5, max_p
 
 def main():
     parser = argparse.ArgumentParser(description='Train weak XGB prefilter for header detection')
+
+    # Data source arguments (mutually exclusive modes)
+    parser.add_argument('--metadata_dir', type=str, default=None,
+                        help='Directory containing *_meta.json files (enables player features)')
+    parser.add_argument('--ball_det_dict_path', type=str, default=None,
+                        help='Path to ball detection dictionary (kinematic features only)')
+
+    # Dataset paths
     parser.add_argument('--dataset_path', type=str, default=str(cfg.DATASET_PATH),
                         help='Path to dataset root')
     parser.add_argument('--header_dataset', type=str, default=str(cfg.DATASET_PATH / 'header_dataset'),
                         help='Path to header annotation dataset')
-    parser.add_argument('--ball_det_dict_path', type=str, default=str(cfg.BALL_DET_DICT_PATH),
-                        help='Path to ball detection dictionary')
+
+    # Feature configuration
+    parser.add_argument('--use_player_features', action='store_true', default=True,
+                        help='Include player-based spatial features (requires --metadata_dir)')
+    parser.add_argument('--no_player_features', action='store_true', default=False,
+                        help='Disable player features even when using metadata')
+
+    # Training arguments
     parser.add_argument('--output_dir', type=str, default=str(cfg.CACHE_PATH / 'pre_xgb'),
                         help='Output directory for models and results')
     parser.add_argument('--neg_ratio', type=float, default=3.0,
@@ -378,71 +631,132 @@ def main():
                         help='Maximum proposals per minute of video')
     parser.add_argument('--n_folds', type=int, default=5,
                         help='Number of CV folds')
-    
+
     args = parser.parse_args()
 
-    dataset_path = Path(args.dataset_path)
-    header_dataset_path = Path(args.header_dataset)
-    ball_det_path = Path(args.ball_det_dict_path)
     output_dir = Path(args.output_dir)
+    use_player_features = args.use_player_features and not args.no_player_features
 
-    print(f"Loading ball detection dictionary from {ball_det_path}")
-    ball_det_dict = load_ball_det_dict(ball_det_path)
-    print(f"Loaded detections for {len(ball_det_dict)} videos")
+    # Determine which mode to use
+    if args.metadata_dir:
+        # Mode 1: Load from metadata JSON files (with player features)
+        print("=" * 60)
+        print("Running in METADATA MODE (with player features)")
+        print("=" * 60)
 
-    print(f"Loading header labels from {header_dataset_path}")
-    labels_df = load_header_labels(header_dataset_path)
-    print(f"Loaded {len(labels_df)} header events across {labels_df['video_id'].nunique()} videos")
+        metadata_dir = Path(args.metadata_dir)
+        if not metadata_dir.exists():
+            print(f"Error: Metadata directory not found: {metadata_dir}")
+            return
 
-    X, y, metadata, feature_names = create_training_data(
-        ball_det_dict, labels_df, args.neg_ratio
-    )
-    
+        # Load features from metadata JSON files
+        all_features, all_samples = load_metadata_from_directory(
+            metadata_dir, use_player_features=use_player_features
+        )
+
+        if not all_samples:
+            print("No samples found in metadata directory!")
+            return
+
+        # Create training data
+        X, y, metadata, feature_names = create_training_data_from_metadata(
+            all_features, all_samples,
+            use_player_features=use_player_features,
+            neg_sampling_ratio=args.neg_ratio
+        )
+
+        # Note: Proposal generation in metadata mode uses the loaded samples
+        ball_det_dict = None
+
+    else:
+        # Mode 2: Load from ball detection dictionary (kinematic features only)
+        print("=" * 60)
+        print("Running in BALL_DET_DICT MODE (kinematic features only)")
+        print("=" * 60)
+
+        ball_det_path = Path(args.ball_det_dict_path or cfg.BALL_DET_DICT_PATH)
+        header_dataset_path = Path(args.header_dataset)
+
+        print(f"Loading ball detection dictionary from {ball_det_path}")
+        ball_det_dict = load_ball_det_dict(ball_det_path)
+        print(f"Loaded detections for {len(ball_det_dict)} videos")
+
+        print(f"Loading header labels from {header_dataset_path}")
+        labels_df = load_header_labels(header_dataset_path)
+        print(f"Loaded {len(labels_df)} header events across {labels_df['video_id'].nunique()} videos")
+
+        X, y, metadata, feature_names = create_training_data(
+            ball_det_dict, labels_df, args.neg_ratio
+        )
+
     if len(X) == 0:
         print("No training data found!")
         return
-    
+
+    print(f"\nFeature set: {len(feature_names)} features")
+    print(f"Features: {feature_names[:10]}... (showing first 10)")
+
     # Train model
     final_model, fold_models, cv_scores = train_pre_xgb(
         X, y, feature_names, output_dir, args.n_folds
     )
-    
-    # Generate proposals
-    proposals = generate_proposals(
-        ball_det_dict, final_model, feature_names, 
-        args.threshold, args.max_proposals_per_min
-    )
-    
-    # Save proposals
-    proposals_path = output_dir / 'proposals.pkl'
-    with open(proposals_path, 'wb') as f:
-        pickle.dump(proposals, f)
-    
-    # Convert to CSV format for cache generation
-    proposals_csv_data = []
-    for video_id, video_proposals in proposals.items():
-        for prop in video_proposals:
-            proposals_csv_data.append({
-                'video_id': video_id,
-                'frame_id': prop['frame_id'],
-                'probability': prop['probability'],
-                'label_type': 'proposal'
-            })
-    
-    proposals_df = pd.DataFrame(proposals_csv_data)
-    proposals_csv_path = output_dir / 'proposals.csv'
-    proposals_df.to_csv(proposals_csv_path, index=False)
-    
-    print(f"\nGenerated {len(proposals_csv_data)} total proposals")
-    print(f"Average proposals per video: {len(proposals_csv_data) / len(proposals):.1f}")
-    print(f"Saved proposals to {proposals_csv_path}")
-    
+
+    # Generate proposals (only in ball_det_dict mode for now)
+    if ball_det_dict:
+        proposals = generate_proposals(
+            ball_det_dict, final_model, feature_names,
+            args.threshold, args.max_proposals_per_min
+        )
+
+        # Save proposals
+        proposals_path = output_dir / 'proposals.pkl'
+        with open(proposals_path, 'wb') as f:
+            pickle.dump(proposals, f)
+
+        # Convert to CSV format for cache generation
+        proposals_csv_data = []
+        for video_id, video_proposals in proposals.items():
+            for prop in video_proposals:
+                proposals_csv_data.append({
+                    'video_id': video_id,
+                    'frame_id': prop['frame_id'],
+                    'probability': prop['probability'],
+                    'label_type': 'proposal'
+                })
+
+        proposals_df = pd.DataFrame(proposals_csv_data)
+        proposals_csv_path = output_dir / 'proposals.csv'
+        proposals_df.to_csv(proposals_csv_path, index=False)
+
+        print(f"\nGenerated {len(proposals_csv_data)} total proposals")
+        if proposals:
+            print(f"Average proposals per video: {len(proposals_csv_data) / len(proposals):.1f}")
+        print(f"Saved proposals to {proposals_csv_path}")
+    else:
+        print("\nNote: Proposal generation skipped in metadata mode.")
+        print("Use the trained model with --inference_only for generating proposals.")
+
     # Save training metadata
     metadata_df = pd.DataFrame(metadata)
     metadata_path = output_dir / 'training_metadata.csv'
     metadata_df.to_csv(metadata_path, index=False)
-    
-    print(f"Training complete! Models and results saved to {output_dir}")
+
+    # Save configuration info
+    config_info = {
+        'mode': 'metadata' if args.metadata_dir else 'ball_det_dict',
+        'use_player_features': use_player_features,
+        'n_features': len(feature_names),
+        'feature_names': feature_names,
+        'neg_ratio': args.neg_ratio,
+        'n_folds': args.n_folds,
+        'cv_auc_mean': float(np.mean(cv_scores)),
+        'cv_auc_std': float(np.std(cv_scores))
+    }
+    config_path = output_dir / 'training_config.json'
+    with open(config_path, 'w') as f:
+        json.dump(config_info, f, indent=2)
+
+    print(f"\nTraining complete! Models and results saved to {output_dir}")
 
 if __name__ == "__main__":
     main()
