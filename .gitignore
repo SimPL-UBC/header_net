@@ -5,6 +5,7 @@ dataset/
 RFDETR-Soccernet/
 visualizations/output/
 __pycache__/
+*__pycache__
 checkpoints/
 report/
 scratch_output/
