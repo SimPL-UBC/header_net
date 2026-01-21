@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -194,17 +195,19 @@ def parse_args() -> argparse.Namespace:
 def run_soccernet_on_video_sparse(
     video: VideoSource,
     model: SoccerNetInference,
-    target_frames: Set[int],
+    target_frames: Sequence[int],
     batch_size: int,
     score_threshold: float,
     topk: int,
-) -> Dict[int, List[Dict[str, float]]]:
+) -> Tuple[Dict[int, List[Dict[str, float]]], int, int]:
     cap = cv2.VideoCapture(str(video.path))
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video {video.path}")
 
-    sorted_frames = sorted(target_frames)
+    sorted_frames = sorted(set(int(frame_id) for frame_id in target_frames))
     raw: Dict[int, List[Dict[str, float]]] = {}
+    requested_count = len(sorted_frames)
+    read_count = 0
     
     batch_frames: List[np.ndarray] = []
     batch_indices: List[int] = []
@@ -224,8 +227,10 @@ def run_soccernet_on_video_sparse(
         
         ret, frame = cap.read()
         if not ret:
-            break
+            current_pos = frame_id + 1
+            continue
         current_pos += 1 # Advance position after read
+        read_count += 1
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         batch_frames.append(rgb)
@@ -244,7 +249,7 @@ def run_soccernet_on_video_sparse(
             raw[fid] = dets
 
     cap.release()
-    return raw
+    return raw, requested_count, read_count
 
 
 def smooth_ball_detections(raw: Dict[int, List[Dict[str, float]]]) -> Dict[int, Dict[str, float]]:
@@ -385,6 +390,8 @@ def main() -> None:
     all_labels = pd.concat([labels_df, negatives_df], ignore_index=True)
     print(f"[INFO] Total samples to process: {len(all_labels)}")
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # 4. Initialize Model
     inference = SoccerNetInference.build(
         weights_path=weights_path,
@@ -397,12 +404,29 @@ def main() -> None:
 
     # 5. Process Videos (Sparse Detection)
     detections: VideoDetections = {}
+    failed_records: List[Dict[str, object]] = []
+    failed_keys: Set[str] = set()
+    success_keys: Set[str] = set()
+    success_matches: Set[str] = set()
     
     # Group by video to minimize video opening/closing
     for (match_name, half), group in tqdm(all_labels.groupby(["video_id", "half"], sort=False), desc="Processing Videos"):
         key = make_video_key(match_name, int(half))
         source = sources.get(key)
         if source is None:
+            failed_records.append(
+                {
+                    "video_id": match_name,
+                    "half": int(half),
+                    "key": key,
+                    "path": None,
+                    "requested_frames": 0,
+                    "read_frames": 0,
+                    "read_ratio": 0.0,
+                    "reason": "video_source_missing",
+                }
+            )
+            failed_keys.add(key)
             continue
 
         # Identify all frames needed for this video
@@ -410,16 +434,69 @@ def main() -> None:
         for frame_val in group['frame'].astype(int):
             for offset in window:
                 target_frames.add(frame_val + offset)
+
+        valid_frames = [frame_id for frame_id in target_frames if 0 <= frame_id < source.frame_count]
+
+        start_time = time.perf_counter()
         
         # Run detection on these frames
-        raw = run_soccernet_on_video_sparse(
-            source,
-            inference,
-            target_frames,
-            batch_size=args.batch_size,
-            score_threshold=args.confidence_threshold,
-            topk=args.topk,
+        try:
+            raw, requested_count, read_count = run_soccernet_on_video_sparse(
+                source,
+                inference,
+                valid_frames,
+                batch_size=args.batch_size,
+                score_threshold=args.confidence_threshold,
+                topk=args.topk,
+            )
+        except Exception as exc:
+            elapsed = time.perf_counter() - start_time
+            failed_records.append(
+                {
+                    "video_id": match_name,
+                    "half": int(half),
+                    "key": key,
+                    "path": str(source.path),
+                    "requested_frames": len(valid_frames),
+                    "read_frames": 0,
+                    "read_ratio": 0.0,
+                    "reason": f"exception: {exc}",
+                    "elapsed_seconds": round(elapsed, 2),
+                }
+            )
+            failed_keys.add(key)
+            print(f"[WARN] Failed to process {key} ({elapsed:.2f}s): {exc}")
+            continue
+
+        elapsed = time.perf_counter() - start_time
+        read_ratio = (read_count / requested_count) if requested_count else 0.0
+        if requested_count == 0 or read_ratio < 0.5:
+            failed_records.append(
+                {
+                    "video_id": match_name,
+                    "half": int(half),
+                    "key": key,
+                    "path": str(source.path),
+                    "requested_frames": requested_count,
+                    "read_frames": read_count,
+                    "read_ratio": round(read_ratio, 4),
+                    "reason": "decode_rate_below_threshold",
+                    "elapsed_seconds": round(elapsed, 2),
+                }
+            )
+            failed_keys.add(key)
+            print(
+                f"[WARN] Skipping {key}: read {read_count}/{requested_count} "
+                f"frames ({read_ratio:.2%}) in {elapsed:.2f}s"
+            )
+            continue
+
+        print(
+            f"[INFO] Processed {key}: read {read_count}/{requested_count} "
+            f"frames ({read_ratio:.2%}) in {elapsed:.2f}s"
         )
+        success_keys.add(key)
+        success_matches.add(str(match_name))
         
         ball = smooth_ball_detections(raw)
         frames = assemble_frame_detections(raw, ball)
@@ -427,6 +504,30 @@ def main() -> None:
             detections[key] = frames
 
     # 6. Create Cache
+    if failed_keys:
+        mask = all_labels.apply(
+            lambda row: make_video_key(row["video_id"], int(row["half"])) not in failed_keys,
+            axis=1,
+        )
+        dropped = len(all_labels) - int(mask.sum())
+        all_labels = all_labels.loc[mask].reset_index(drop=True)
+        print(f"[WARN] Dropped {dropped} samples from failed videos before cache creation")
+
+        failed_df = pd.DataFrame(failed_records)
+        failed_path = output_dir / "failed_videos.csv"
+        failed_df.to_csv(failed_path, index=False)
+        print(f"[WARN] Logged {len(failed_df)} failed videos to {failed_path}")
+    elif failed_records:
+        failed_df = pd.DataFrame(failed_records)
+        failed_path = output_dir / "failed_videos.csv"
+        failed_df.to_csv(failed_path, index=False)
+        print(f"[WARN] Logged {len(failed_df)} failed videos to {failed_path}")
+
+    print(
+        f"[INFO] Successfully processed {len(success_keys)} video halves across "
+        f"{len(success_matches)} matches"
+    )
+
     print("[INFO] Creating cache files...")
     cache_df = create_header_cache(
         detections,
