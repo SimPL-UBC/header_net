@@ -99,9 +99,9 @@ def parse_args() -> argparse.Namespace:
         help="Path to dataset root containing SoccerNet videos",
     )
     parser.add_argument(
-        "--header-dataset",
-        default=str(cfg.HEADER_DATASET_PATH),
-        help="Path to header dataset annotations",
+        "--labels-dir",
+        required=True,
+        help="Path to SoccerNet labelled_header directory",
     )
     parser.add_argument(
         "--weights",
@@ -110,8 +110,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(cfg.CACHE_PATH / "cache_header"),
+        required=True,
         help="Directory to store generated cache",
+    )
+    parser.add_argument(
+        "--output-name",
+        required=True,
+        help="CSV filename for the cache index (must end with .csv)",
     )
     parser.add_argument(
         "--confidence-threshold",
@@ -336,15 +341,21 @@ def main() -> None:
         raise ValueError("batch-size must be >= 1")
 
     dataset_path = Path(args.dataset_path)
-    header_dataset = Path(args.header_dataset)
+    labels_dir = Path(args.labels_dir)
     weights_path = Path(args.weights)
     output_dir = Path(args.output_dir)
+    output_name = args.output_name
     window = args.window if args.window else cfg.WINDOW_SIZE
 
+    if Path(output_name).name != output_name:
+        raise ValueError("output-name must be a filename, not a path")
+    if not output_name.lower().endswith(".csv"):
+        raise ValueError("output-name must end with .csv")
+
     # 1. Load Labels
-    labels_df, resolved_root = load_labels_dataframe(header_dataset)
+    labels_df, resolved_root = load_labels_dataframe(labels_dir)
     if labels_df.empty:
-        raise SystemExit(f"No header labels found. Verify header dataset path: {header_dataset}")
+        raise SystemExit(f"No header labels found. Verify labels dir: {labels_dir}")
     print(f"[INFO] Loaded {len(labels_df)} header labels from {resolved_root}")
 
     # 2. Discover Videos
@@ -415,6 +426,7 @@ def main() -> None:
         all_labels,
         sources,
         output_dir,
+        output_name,
         window,
         args.crop_scale_factor,
         cfg.OUTPUT_SIZE,

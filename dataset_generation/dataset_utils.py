@@ -19,21 +19,95 @@ HEADER_NET_ROOT = Path(__file__).resolve().parents[1]
 if str(HEADER_NET_ROOT) not in sys.path:
     sys.path.append(str(HEADER_NET_ROOT))
 
-from configs import header_default as cfg
-from utils.labels import load_header_labels, build_half_frame_lookup, canonical_match_name
+from utils.labels import canonical_match_name
 from utils.detections import (
     BallDetections,
-    load_ball_det_dict,
     make_video_key,
 )
+from utils.videos import infer_half_from_stem
+
+LABEL_SUFFIXES = {".xlsx", ".ods", ".csv"}
 
 
-def load_labels_dataframe(header_dataset: Path) -> Tuple[pd.DataFrame, Optional[Path]]:
-    """Load header labels from the specified dataset path."""
-    header_dataset = header_dataset.expanduser()
-    df = load_header_labels(header_dataset)
+def _extract_numeric_frames(df: pd.DataFrame) -> List[int]:
+    frame_cols = [col for col in df.columns if "frame" in str(col).lower()]
+    if frame_cols:
+        candidates = (df[col] for col in frame_cols)
+    else:
+        candidates = (df.iloc[:, 0],)
+
+    frames: List[int] = []
+    for series in candidates:
+        if series is None:
+            continue
+        series = pd.to_numeric(series, errors="coerce")
+        frames.extend(series.dropna().astype(int).tolist())
+
+    return frames
+
+
+def load_labels_from_labelled_header(labels_dir: Path) -> pd.DataFrame:
+    labels_dir = labels_dir.expanduser()
+    entries: List[dict] = []
+
+    if not labels_dir.exists():
+        return pd.DataFrame()
+
+    for match_dir in labels_dir.iterdir():
+        if not match_dir.is_dir():
+            continue
+
+        label_files = [
+            file_path
+            for file_path in match_dir.iterdir()
+            if file_path.is_file() and file_path.suffix.lower() in LABEL_SUFFIXES
+        ]
+        if not label_files:
+            continue
+
+        video_id = canonical_match_name(match_dir.name)
+        for file_path in label_files:
+            try:
+                if file_path.suffix.lower() == ".csv":
+                    df = pd.read_csv(file_path)
+                elif file_path.suffix.lower() == ".ods":
+                    df = pd.read_excel(file_path, engine="odf")
+                else:
+                    df = pd.read_excel(file_path)
+            except Exception as exc:
+                print(f"[WARN] Failed to read label file {file_path}: {exc}")
+                continue
+
+            frames = _extract_numeric_frames(df)
+            if not frames:
+                continue
+
+            half = infer_half_from_stem(file_path.stem)
+            for frame in frames:
+                entries.append(
+                    {
+                        "video_id": video_id,
+                        "half": half,
+                        "frame": int(frame),
+                        "label": 1,
+                    }
+                )
+
+    df = pd.DataFrame(entries)
     if not df.empty:
-        return df, header_dataset
+        df.drop_duplicates(subset=["video_id", "half", "frame"], inplace=True)
+        df.sort_values(["video_id", "half", "frame"], inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+    return df
+
+
+def load_labels_dataframe(labels_dir: Path) -> Tuple[pd.DataFrame, Optional[Path]]:
+    """Load header labels from a SoccerNet labelled_header directory."""
+    labels_dir = labels_dir.expanduser()
+    df = load_labels_from_labelled_header(labels_dir)
+    if not df.empty:
+        return df, labels_dir
     return pd.DataFrame(), None
 
 
@@ -507,6 +581,7 @@ def create_header_cache(
     labels_df: pd.DataFrame,
     sources: Dict[str, VideoSource],
     output_dir: Path,
+    output_name: str,
     window: Sequence[int],
     crop_scale_factor: float,
     high_res_output: int,
@@ -615,7 +690,7 @@ def create_header_cache(
 
     df = pd.DataFrame(records)
     if not df.empty:
-        df.to_csv(output_dir / "train_cache_header.csv", index=False)
+        df.to_csv(output_dir / output_name, index=False)
 
     skipped_df = pd.DataFrame(skipped)
     skipped_path = output_dir / "skipped_samples.csv"
