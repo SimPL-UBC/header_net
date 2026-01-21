@@ -16,14 +16,19 @@ class PostXGBFilter:
     """
     Post-filter stage using XGBoost for temporal smoothing.
 
-    This stage uses CNN predictions from a temporal window (±15 frames)
-    to refine predictions and suppress spurious detections.
+    This stage uses CNN and pre-XGB predictions from a temporal window
+    (±15 frames) to refine predictions and suppress spurious detections.
 
-    Features (48 total):
+    Features (82 total):
+    - Center frame probs: CNN, pre-XGB (2)
     - 31 per-frame CNN probabilities (from -15 to +15)
-    - Statistical aggregates: mean, std, max, min, median
-    - Trend features: slope
-    - Local maxima indicators
+    - 31 per-frame pre-XGB probabilities (from -15 to +15)
+    - Statistical aggregates for CNN: mean, std, max, min, median (5)
+    - Statistical aggregates for pre-XGB: mean, std, max, min, median (5)
+    - Trend features: cnn_prob_slope, pre_xgb_prob_slope (2)
+    - Local maxima indicators: is_local_max_cnn, is_local_max_pre_xgb (2)
+
+    Note: Ensemble features have been removed from this version.
 
     Attributes:
         config: Inference configuration.
@@ -64,22 +69,45 @@ class PostXGBFilter:
         print(f"Post-XGB model loaded with {len(self.feature_names)} features")
 
     def _build_default_feature_names(self) -> List[str]:
-        """Build default feature names for post-filter."""
+        """Build default feature names for post-filter (82 features, no ensemble)."""
         names = []
 
-        # Per-frame probabilities
+        # Center frame probabilities (2)
+        names.extend([
+            "center_cnn_prob",
+            "center_pre_xgb_prob",
+        ])
+
+        # Per-frame probabilities (62: 31 cnn + 31 pre_xgb)
         for offset in range(-self.window_size, self.window_size + 1):
             names.append(f"cnn_prob_{offset}")
+        for offset in range(-self.window_size, self.window_size + 1):
+            names.append(f"pre_xgb_prob_{offset}")
 
-        # Statistical aggregates
+        # Statistical aggregates (10: 5 cnn + 5 pre_xgb)
         names.extend([
             "cnn_prob_mean",
             "cnn_prob_std",
             "cnn_prob_max",
             "cnn_prob_min",
             "cnn_prob_median",
+            "pre_xgb_prob_mean",
+            "pre_xgb_prob_std",
+            "pre_xgb_prob_max",
+            "pre_xgb_prob_min",
+            "pre_xgb_prob_median",
+        ])
+
+        # Slopes (2)
+        names.extend([
             "cnn_prob_slope",
+            "pre_xgb_prob_slope",
+        ])
+
+        # Local maxima indicators (2)
+        names.extend([
             "is_local_max_cnn",
+            "is_local_max_pre_xgb",
         ])
 
         return names
@@ -90,34 +118,50 @@ class PostXGBFilter:
         center_idx: int,
     ) -> Optional[Dict[str, float]]:
         """
-        Extract temporal features around center prediction.
+        Extract temporal features around center prediction (no ensemble).
 
         Args:
             predictions: Sorted list of FramePrediction objects.
             center_idx: Index of center prediction in the list.
 
         Returns:
-            Feature dictionary or None if window is incomplete.
+            Feature dictionary with 82 features.
         """
         window = self.window_size
         cnn_probs = []
+        pre_xgb_probs = []
 
-        # Collect probabilities in window
+        frame_to_pred = {p.frame_idx: p for p in predictions}
+        center_frame = predictions[center_idx].frame_idx
+
+        # Collect probabilities in window based on true frame offsets
         for offset in range(-window, window + 1):
-            target_idx = center_idx + offset
-            if 0 <= target_idx < len(predictions):
-                prob = predictions[target_idx].cnn_prob or 0.0
-                cnn_probs.append(prob)
+            target_frame = center_frame + offset
+            target_pred = frame_to_pred.get(target_frame)
+            if target_pred is not None:
+                cnn_prob = target_pred.cnn_prob or 0.0
+                pre_xgb_prob = target_pred.pre_xgb_prob or 0.0
             else:
-                cnn_probs.append(0.0)
+                cnn_prob = 0.0
+                pre_xgb_prob = 0.0
+
+            cnn_probs.append(cnn_prob)
+            pre_xgb_probs.append(pre_xgb_prob)
 
         # Build feature dict
         features = {}
+
+        # Center frame probabilities
+        features["center_cnn_prob"] = cnn_probs[window]
+        features["center_pre_xgb_prob"] = pre_xgb_probs[window]
 
         # Per-frame probabilities
         for i, prob in enumerate(cnn_probs):
             offset = i - window
             features[f"cnn_prob_{offset}"] = prob
+        for i, prob in enumerate(pre_xgb_probs):
+            offset = i - window
+            features[f"pre_xgb_prob_{offset}"] = prob
 
         # Statistical aggregates
         features["cnn_prob_mean"] = np.mean(cnn_probs)
@@ -125,23 +169,37 @@ class PostXGBFilter:
         features["cnn_prob_max"] = np.max(cnn_probs)
         features["cnn_prob_min"] = np.min(cnn_probs)
         features["cnn_prob_median"] = np.median(cnn_probs)
+        features["pre_xgb_prob_mean"] = np.mean(pre_xgb_probs)
+        features["pre_xgb_prob_std"] = np.std(pre_xgb_probs)
+        features["pre_xgb_prob_max"] = np.max(pre_xgb_probs)
+        features["pre_xgb_prob_min"] = np.min(pre_xgb_probs)
+        features["pre_xgb_prob_median"] = np.median(pre_xgb_probs)
 
         # Trend (slope)
         if len(cnn_probs) >= 3:
             x = np.arange(len(cnn_probs))
             features["cnn_prob_slope"] = np.polyfit(x, cnn_probs, 1)[0]
+            features["pre_xgb_prob_slope"] = np.polyfit(x, pre_xgb_probs, 1)[0]
         else:
             features["cnn_prob_slope"] = 0.0
+            features["pre_xgb_prob_slope"] = 0.0
 
         # Local maxima indicator
         center = window
-        is_local_max = (
+        is_local_max_cnn = (
             center > 0
             and center < len(cnn_probs) - 1
             and cnn_probs[center] >= cnn_probs[center - 1]
             and cnn_probs[center] >= cnn_probs[center + 1]
         )
-        features["is_local_max_cnn"] = float(is_local_max)
+        features["is_local_max_cnn"] = float(is_local_max_cnn)
+        is_local_max_pre_xgb = (
+            center > 0
+            and center < len(pre_xgb_probs) - 1
+            and pre_xgb_probs[center] >= pre_xgb_probs[center - 1]
+            and pre_xgb_probs[center] >= pre_xgb_probs[center + 1]
+        )
+        features["is_local_max_pre_xgb"] = float(is_local_max_pre_xgb)
 
         return features
 
@@ -191,14 +249,16 @@ class PostXGBFilter:
     def refine_with_cnn_probs(
         self,
         frame_probs: Dict[int, float],
+        pre_xgb_probs: Optional[Dict[int, float]] = None,
     ) -> Dict[int, float]:
         """
-        Refine CNN probabilities using temporal context.
+        Refine CNN probabilities using temporal context (no ensemble).
 
         Alternative interface using dictionary of probabilities.
 
         Args:
             frame_probs: Dictionary mapping frame_idx -> CNN probability.
+            pre_xgb_probs: Optional dictionary mapping frame_idx -> pre-XGB probability.
 
         Returns:
             Dictionary mapping frame_idx -> refined probability.
@@ -206,42 +266,64 @@ class PostXGBFilter:
         if not frame_probs:
             return {}
 
-        sorted_frames = sorted(frame_probs.keys())
-        probs_list = [frame_probs[f] for f in sorted_frames]
-
         refined = {}
 
-        for i, frame_idx in enumerate(sorted_frames):
-            # Build window
-            cnn_probs = []
-            for offset in range(-self.window_size, self.window_size + 1):
-                target_idx = i + offset
-                if 0 <= target_idx < len(probs_list):
-                    cnn_probs.append(probs_list[target_idx])
-                else:
-                    cnn_probs.append(0.0)
+        sorted_frames = sorted(frame_probs.keys())
 
-            # Build features
-            features = {}
+        for frame_idx in sorted_frames:
+            # Build window based on true frame offsets
+            cnn_probs = []
+            pre_probs = []
+
+            for offset in range(-self.window_size, self.window_size + 1):
+                target_frame = frame_idx + offset
+                cnn_prob = frame_probs.get(target_frame, 0.0)
+                pre_prob = 0.0
+                if pre_xgb_probs is not None:
+                    pre_prob = pre_xgb_probs.get(target_frame, 0.0)
+
+                cnn_probs.append(cnn_prob)
+                pre_probs.append(pre_prob)
+
+            # Build features (no ensemble)
+            features = {
+                "center_cnn_prob": cnn_probs[self.window_size],
+                "center_pre_xgb_prob": pre_probs[self.window_size],
+            }
+
             for j, prob in enumerate(cnn_probs):
                 offset = j - self.window_size
                 features[f"cnn_prob_{offset}"] = prob
+            for j, prob in enumerate(pre_probs):
+                offset = j - self.window_size
+                features[f"pre_xgb_prob_{offset}"] = prob
 
             features["cnn_prob_mean"] = np.mean(cnn_probs)
             features["cnn_prob_std"] = np.std(cnn_probs)
             features["cnn_prob_max"] = np.max(cnn_probs)
             features["cnn_prob_min"] = np.min(cnn_probs)
             features["cnn_prob_median"] = np.median(cnn_probs)
+            features["pre_xgb_prob_mean"] = np.mean(pre_probs)
+            features["pre_xgb_prob_std"] = np.std(pre_probs)
+            features["pre_xgb_prob_max"] = np.max(pre_probs)
+            features["pre_xgb_prob_min"] = np.min(pre_probs)
+            features["pre_xgb_prob_median"] = np.median(pre_probs)
 
             x = np.arange(len(cnn_probs))
             features["cnn_prob_slope"] = np.polyfit(x, cnn_probs, 1)[0]
+            features["pre_xgb_prob_slope"] = np.polyfit(x, pre_probs, 1)[0]
 
             center = self.window_size
-            is_local_max = (
+            is_local_max_cnn = (
                 cnn_probs[center] >= cnn_probs[center - 1]
                 and cnn_probs[center] >= cnn_probs[center + 1]
             )
-            features["is_local_max_cnn"] = float(is_local_max)
+            features["is_local_max_cnn"] = float(is_local_max_cnn)
+            is_local_max_pre = (
+                pre_probs[center] >= pre_probs[center - 1]
+                and pre_probs[center] >= pre_probs[center + 1]
+            )
+            features["is_local_max_pre_xgb"] = float(is_local_max_pre)
 
             # Predict
             feat_vector = [features.get(fn, 0.0) for fn in self.feature_names]

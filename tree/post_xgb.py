@@ -11,6 +11,7 @@ import pandas as pd
 import argparse
 from tqdm import tqdm
 import pickle
+from pathlib import Path
 from sklearn.model_selection import KFold
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 import xgboost as xgb
@@ -19,140 +20,220 @@ import xgboost as xgb
 sys.path.append('../configs')
 from header_default import *
 
+HEADER_NET_ROOT = Path(__file__).resolve().parents[1]
+if str(HEADER_NET_ROOT) not in sys.path:
+    sys.path.append(str(HEADER_NET_ROOT))
+
+from utils.detections import make_video_key
+
 def load_probabilities(probs_path):
-    """Load CNN probabilities from CSV"""
+    """Load CNN and pre-XGB probabilities from CSV (no ensemble).
+
+    Args:
+        probs_path: Path to CSV with video_id, frame_id, cnn_prob, pre_xgb_prob
+
+    Returns:
+        DataFrame with probability columns
+
+    Raises:
+        ValueError: If required columns are missing (pre_xgb_prob is mandatory)
+    """
     print(f"Loading probabilities from {probs_path}")
     df = pd.read_csv(probs_path)
-    
-    # Ensure required columns exist
-    required_cols = ['video_id', 'frame_id', 'cnn_prob', 'ensemble_prob']
+
+    # Ensure required columns exist - pre_xgb_prob is now mandatory
+    required_cols = ['video_id', 'frame_id', 'cnn_prob', 'pre_xgb_prob']
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
-    
+        raise ValueError(
+            f"Missing required columns: {missing_cols}. "
+            f"Pre-XGB is mandatory for post-XGB training. "
+            f"Use export_probs_raw_video.py to generate probabilities."
+        )
+
+    # Warn if ensemble_prob exists (it will be ignored)
+    if 'ensemble_prob' in df.columns:
+        print("Warning: ensemble_prob column found but will be ignored (ensemble features removed)")
+
+    df['frame_id'] = df['frame_id'].astype(int)
+    df['video_id'] = df['video_id'].astype(str)
+
     print(f"Loaded {len(df)} probability records")
     return df
 
 def build_temporal_features(probs_df, window_size=15):
     """
-    Build temporal features from CNN probabilities
-    Following NFL solution: use neighboring probabilities as features
-    
+    Build temporal features from CNN and pre-XGB probabilities (no ensemble).
+
+    Following NFL solution: use neighboring probabilities as features.
+    Ensemble features have been removed - only CNN and pre-XGB are used.
+
     Args:
-        probs_df: DataFrame with columns [video_id, frame_id, cnn_prob, ensemble_prob, ...]
+        probs_df: DataFrame with columns [video_id, frame_id, cnn_prob, pre_xgb_prob]
         window_size: Size of temporal window (total window = 2*window_size + 1)
-    
+
     Returns:
-        DataFrame with temporal features
+        DataFrame with 82 temporal features (was 123 with ensemble)
     """
     print(f"Building temporal features with window size {window_size}...")
-    
+
     temporal_features = []
-    
+
     # Group by video for temporal processing
     for video_id, video_df in tqdm(probs_df.groupby('video_id')):
         # Sort by frame_id
         video_df = video_df.sort_values('frame_id').reset_index(drop=True)
-        
+
         # Create frame lookup for fast access
-        frame_to_idx = {row['frame_id']: idx for idx, row in video_df.iterrows()}
-        
+        frame_to_row = {
+            int(row['frame_id']): row
+            for _, row in video_df.iterrows()
+        }
+
         for idx, row in video_df.iterrows():
-            frame_id = row['frame_id']
-            
-            # Initialize feature dictionary
+            frame_id = int(row['frame_id'])
+
+            # Initialize feature dictionary (no ensemble)
             features = {
                 'video_id': video_id,
                 'frame_id': frame_id,
-                'center_pre_xgb_prob': row.get('pre_xgb_prob', 0.0),
                 'center_cnn_prob': row['cnn_prob'],
-                'center_ensemble_prob': row['ensemble_prob']
+                'center_pre_xgb_prob': float(row['pre_xgb_prob']),
             }
-            
-            # Extract temporal window features
+
+            # Extract temporal window features (no ensemble)
             cnn_probs = []
-            ensemble_probs = []
             pre_xgb_probs = []
-            
+
             for offset in range(-window_size, window_size + 1):
-                target_idx = idx + offset
-                
-                if 0 <= target_idx < len(video_df):
+                target_frame = frame_id + offset
+                target_row = frame_to_row.get(target_frame)
+
+                if target_row is not None:
                     # Valid frame within video
-                    target_row = video_df.iloc[target_idx]
                     cnn_probs.append(target_row['cnn_prob'])
-                    ensemble_probs.append(target_row['ensemble_prob'])
-                    pre_xgb_probs.append(target_row.get('pre_xgb_prob', 0.0))
+                    pre_xgb_probs.append(float(target_row['pre_xgb_prob']))
                 else:
                     # Pad with zeros for frames outside video bounds
                     cnn_probs.append(0.0)
-                    ensemble_probs.append(0.0)
                     pre_xgb_probs.append(0.0)
-            
+
             # Add individual probability features (similar to NFL solution)
             for i, prob in enumerate(cnn_probs):
                 features[f'cnn_prob_{i-window_size}'] = prob
-            
-            for i, prob in enumerate(ensemble_probs):
-                features[f'ensemble_prob_{i-window_size}'] = prob
-            
-            # Add statistical features over the window
+
+            for i, prob in enumerate(pre_xgb_probs):
+                features[f'pre_xgb_prob_{i-window_size}'] = prob
+
+            # Add statistical features over the window (no ensemble)
             features.update({
                 'cnn_prob_mean': np.mean(cnn_probs),
                 'cnn_prob_std': np.std(cnn_probs),
                 'cnn_prob_max': np.max(cnn_probs),
                 'cnn_prob_min': np.min(cnn_probs),
                 'cnn_prob_median': np.median(cnn_probs),
-                
-                'ensemble_prob_mean': np.mean(ensemble_probs),
-                'ensemble_prob_std': np.std(ensemble_probs),
-                'ensemble_prob_max': np.max(ensemble_probs),
-                'ensemble_prob_min': np.min(ensemble_probs),
-                'ensemble_prob_median': np.median(ensemble_probs),
-                
+
                 'pre_xgb_prob_mean': np.mean(pre_xgb_probs),
                 'pre_xgb_prob_std': np.std(pre_xgb_probs),
-                'pre_xgb_prob_max': np.max(pre_xgb_probs)
+                'pre_xgb_prob_max': np.max(pre_xgb_probs),
+                'pre_xgb_prob_min': np.min(pre_xgb_probs),
+                'pre_xgb_prob_median': np.median(pre_xgb_probs),
             })
-            
-            # Add trend features
+
+            # Add trend features (no ensemble)
             if len(cnn_probs) >= 3:
                 # Linear trend (slope)
                 x = np.arange(len(cnn_probs))
                 cnn_slope = np.polyfit(x, cnn_probs, 1)[0]
-                ensemble_slope = np.polyfit(x, ensemble_probs, 1)[0]
-                
+                pre_xgb_slope = np.polyfit(x, pre_xgb_probs, 1)[0]
+
                 features.update({
                     'cnn_prob_slope': cnn_slope,
-                    'ensemble_prob_slope': ensemble_slope
+                    'pre_xgb_prob_slope': pre_xgb_slope,
                 })
             else:
                 features.update({
                     'cnn_prob_slope': 0.0,
-                    'ensemble_prob_slope': 0.0
+                    'pre_xgb_prob_slope': 0.0,
                 })
-            
-            # Add local maxima indicators
+
+            # Add local maxima indicators (no ensemble)
             center_idx = window_size
             is_local_max_cnn = (center_idx > 0 and center_idx < len(cnn_probs) - 1 and
                                cnn_probs[center_idx] >= cnn_probs[center_idx-1] and
                                cnn_probs[center_idx] >= cnn_probs[center_idx+1])
-            
-            is_local_max_ensemble = (center_idx > 0 and center_idx < len(ensemble_probs) - 1 and
-                                   ensemble_probs[center_idx] >= ensemble_probs[center_idx-1] and
-                                   ensemble_probs[center_idx] >= ensemble_probs[center_idx+1])
-            
+
+            is_local_max_pre_xgb = (center_idx > 0 and center_idx < len(pre_xgb_probs) - 1 and
+                                    pre_xgb_probs[center_idx] >= pre_xgb_probs[center_idx-1] and
+                                    pre_xgb_probs[center_idx] >= pre_xgb_probs[center_idx+1])
+
             features.update({
                 'is_local_max_cnn': float(is_local_max_cnn),
-                'is_local_max_ensemble': float(is_local_max_ensemble)
+                'is_local_max_pre_xgb': float(is_local_max_pre_xgb),
             })
-            
+
             temporal_features.append(features)
-    
+
     temporal_df = pd.DataFrame(temporal_features)
-    print(f"Built temporal features for {len(temporal_df)} samples")
-    
+    print(f"Built temporal features for {len(temporal_df)} samples (82 features)")
+
     return temporal_df
+
+def load_ground_truth_labels_from_csv(label_paths):
+    """Load ground truth header labels from dataset_generation CSVs."""
+    if not label_paths:
+        return {}
+
+    labels = {}
+    paths = []
+
+    for path in label_paths:
+        path_obj = Path(path)
+        if path_obj.is_dir():
+            paths.extend(sorted(path_obj.glob("*.csv")))
+        else:
+            paths.append(path_obj)
+
+    for csv_path in paths:
+        if not csv_path.exists():
+            print(f"Warning: labels CSV not found: {csv_path}")
+            continue
+
+        df = pd.read_csv(csv_path)
+        if 'label' not in df.columns:
+            print(f"Warning: skipping {csv_path} (missing label column)")
+            continue
+
+        frame_col = 'frame' if 'frame' in df.columns else 'frame_id' if 'frame_id' in df.columns else None
+        if frame_col is None or 'video_id' not in df.columns:
+            print(f"Warning: skipping {csv_path} (missing frame/video columns)")
+            continue
+
+        positive_df = df[df['label'] == 1]
+        if positive_df.empty:
+            continue
+
+        if 'half' in positive_df.columns:
+            def build_key(row):
+                raw_video = str(row['video_id'])
+                if '_half' in raw_video:
+                    return raw_video
+                return make_video_key(raw_video, row['half'])
+
+            positive_df = positive_df.copy()
+            positive_df['video_key'] = positive_df.apply(build_key, axis=1)
+        else:
+            positive_df = positive_df.copy()
+            positive_df['video_key'] = positive_df['video_id'].astype(str)
+
+        for _, row in positive_df.iterrows():
+            video_key = row['video_key']
+            frame_id = int(row[frame_col])
+            if video_key not in labels:
+                labels[video_key] = set()
+            labels[video_key].add(frame_id)
+
+    return labels
 
 def load_ground_truth_labels(dataset_path):
     """Load ground truth header labels for evaluation"""
@@ -316,25 +397,36 @@ def train_post_xgb(temporal_df, output_dir, window_size=15, n_folds=5):
     return final_model, models, cv_scores, feature_cols
 
 def apply_post_processing(temporal_df, model, feature_cols, output_path):
-    """Apply trained post-processing model to get final scores"""
-    
+    """Apply trained post-processing model to get final scores.
+
+    Args:
+        temporal_df: DataFrame with temporal features
+        model: Trained XGBoost classifier
+        feature_cols: List of feature column names
+        output_path: Path to save results CSV
+
+    Returns:
+        DataFrame with final probabilities
+    """
     # Prepare features
     X = temporal_df[feature_cols].values
-    
+
     # Predict final probabilities
     final_probs = model.predict_proba(X)[:, 1]
-    
-    # Add to dataframe
-    result_df = temporal_df[['video_id', 'frame_id', 'center_cnn_prob', 'center_ensemble_prob']].copy()
+
+    # Add to dataframe (no ensemble columns)
+    result_df = temporal_df[
+        ['video_id', 'frame_id', 'center_cnn_prob', 'center_pre_xgb_prob']
+    ].copy()
     result_df['final_prob'] = final_probs
-    
+
     # Save results
     result_df.to_csv(output_path, index=False)
-    
+
     print(f"Applied post-processing to {len(result_df)} samples")
     print(f"Final prob stats: mean={np.mean(final_probs):.4f}, std={np.std(final_probs):.4f}")
     print(f"Results saved to {output_path}")
-    
+
     return result_df
 
 def main():
@@ -345,16 +437,37 @@ def main():
                         help='Path to dataset for ground truth labels')
     parser.add_argument('--output_dir', type=str, default='post_xgb',
                         help='Output directory for models and results')
+    parser.add_argument('--labels_csv', type=str, nargs='*', default=None,
+                        help='Path(s) to dataset_generation CSVs with labels')
     parser.add_argument('--window_size', type=int, default=15,
-                        help='Temporal window size for features')
+                        help='Temporal window size for features (must be 15)')
     parser.add_argument('--n_folds', type=int, default=5,
                         help='Number of CV folds')
     parser.add_argument('--inference_only', action='store_true',
                         help='Only run inference with pre-trained model')
     parser.add_argument('--model_path', type=str, default=None,
                         help='Path to pre-trained model for inference')
-    
+
+    # Export metadata for output naming
+    parser.add_argument('--backbone', type=str, default='vmae',
+                        choices=['vmae', 'csn'],
+                        help='CNN backbone used for training data')
+    parser.add_argument('--export_mode', type=str, default=None,
+                        choices=['ball_only', 'every_n'],
+                        help='Frame selection mode used in export')
+    parser.add_argument('--export_stride', type=int, default=None,
+                        help='Stride value for every_n mode')
+    parser.add_argument('--export_threshold', type=float, default=None,
+                        help='Pre-XGB threshold used during export')
+
     args = parser.parse_args()
+
+    # HARD CONSTRAINT: window_size must be 15
+    if args.window_size != 15:
+        raise ValueError(
+            f"window_size must be 15, got {args.window_size}. "
+            "This is required for compatibility with trained post-XGB models."
+        )
     
     # Load probabilities
     probs_df = load_probabilities(args.probs_csv)
@@ -378,31 +491,45 @@ def main():
         
         # Apply post-processing
         output_path = os.path.join(args.output_dir, 'final_predictions.csv')
-        result_df = apply_post_processing(temporal_df, model, feature_cols, output_path)
+        apply_post_processing(temporal_df, model, feature_cols, output_path)
         
     else:
         # Training mode
         print("Loading ground truth labels...")
-        ground_truth_labels = load_ground_truth_labels(args.dataset_path)
+        if args.labels_csv:
+            ground_truth_labels = load_ground_truth_labels_from_csv(args.labels_csv)
+        else:
+            ground_truth_labels = load_ground_truth_labels(args.dataset_path)
         print(f"Loaded ground truth for {len(ground_truth_labels)} videos")
-        
+
         # Create training data
         temporal_df = create_training_data_for_postprocessing(temporal_df, ground_truth_labels)
-        
+
         if temporal_df['label'].sum() == 0:
             print("No positive samples found! Check ground truth labels.")
             return
-        
+
+        # Build output directory with naming convention
+        output_dir = args.output_dir
+        if args.export_mode and args.export_threshold is not None:
+            if args.export_mode == 'ball_only':
+                run_name = f"post_xgb_{args.backbone}_ball_only_thr{args.export_threshold}"
+            else:  # every_n
+                stride = args.export_stride if args.export_stride else 5
+                run_name = f"post_xgb_{args.backbone}_every_n_stride{stride}_thr{args.export_threshold}"
+            output_dir = os.path.join(args.output_dir, run_name)
+            print(f"Output directory: {output_dir}")
+
         # Train model
-        final_model, fold_models, cv_scores, feature_cols = train_post_xgb(
-            temporal_df, args.output_dir, args.window_size, args.n_folds
+        final_model, _, _, feature_cols = train_post_xgb(
+            temporal_df, output_dir, args.window_size, args.n_folds
         )
-        
+
         # Apply to all data for final predictions
-        output_path = os.path.join(args.output_dir, 'final_predictions.csv')
-        result_df = apply_post_processing(temporal_df, final_model, feature_cols, output_path)
-        
-        print(f"Post-processing training complete! Results saved to {args.output_dir}")
+        output_path = os.path.join(output_dir, 'final_predictions.csv')
+        apply_post_processing(temporal_df, final_model, feature_cols, output_path)
+
+        print(f"Post-processing training complete! Results saved to {output_dir}")
 
 if __name__ == "__main__":
     main()

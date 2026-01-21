@@ -2,12 +2,13 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 import argparse
 
+
 @dataclass
 class Config:
     # Data
     train_csv: str = ""
     val_csv: str = ""
-    num_frames: int = 11  # Default to current cache value
+    num_frames: int = 16  # Default to current cache value
     input_size: int = 224
     frame_sampling: str = "center"  # Phase 1: only "center" supported
 
@@ -25,42 +26,60 @@ class Config:
     epochs: int = 50
     batch_size: int = 16
     num_workers: int = 8
-    
+
     # Run
     run_name: str = ""
     seed: int = 42
     output_root: str = "report/header_experiments"
     gpus: Optional[List[int]] = None
 
+
 def merge_cli_args(args: argparse.Namespace) -> Config:
     """
     Merges CLI arguments into a Config instance.
     """
     config = Config()
-    
+
     # Data
-    if hasattr(args, 'train_csv'): config.train_csv = args.train_csv
-    if hasattr(args, 'val_csv'): config.val_csv = args.val_csv
-    
+    if hasattr(args, "train_csv"):
+        config.train_csv = args.train_csv
+    if hasattr(args, "val_csv"):
+        config.val_csv = args.val_csv
+
     # Model
-    if hasattr(args, 'backbone'): config.backbone = args.backbone
-    if hasattr(args, 'finetune_mode'): config.finetune_mode = args.finetune_mode
-    if hasattr(args, 'unfreeze_blocks'): config.unfreeze_blocks = args.unfreeze_blocks
-    if hasattr(args, 'backbone_ckpt'): config.backbone_ckpt = args.backbone_ckpt
-    
+    if hasattr(args, "backbone"):
+        config.backbone = args.backbone
+    if hasattr(args, "finetune_mode"):
+        config.finetune_mode = args.finetune_mode
+    if hasattr(args, "unfreeze_blocks"):
+        config.unfreeze_blocks = args.unfreeze_blocks
+    if hasattr(args, "backbone_ckpt"):
+        config.backbone_ckpt = args.backbone_ckpt
+
     # Optimization
-    if hasattr(args, 'lr_backbone'): config.lr_backbone = args.lr_backbone
-    if hasattr(args, 'lr_head'): config.lr_head = args.lr_head
-    if hasattr(args, 'weight_decay'): config.weight_decay = args.weight_decay
-    if hasattr(args, 'epochs'): config.epochs = args.epochs
-    if hasattr(args, 'batch_size'): config.batch_size = args.batch_size
-    if hasattr(args, 'num_workers'): config.num_workers = args.num_workers
-    
+    if hasattr(args, "lr_backbone"):
+        config.lr_backbone = args.lr_backbone
+    if hasattr(args, "lr_head"):
+        config.lr_head = args.lr_head
+    if hasattr(args, "weight_decay"):
+        config.weight_decay = args.weight_decay
+    if hasattr(args, "epochs"):
+        config.epochs = args.epochs
+    if hasattr(args, "batch_size"):
+        config.batch_size = args.batch_size
+    if hasattr(args, "num_workers"):
+        config.num_workers = args.num_workers
+
     # Run
-    if hasattr(args, 'run_name'): config.run_name = args.run_name
-    if hasattr(args, 'seed'): config.seed = args.seed
-    if hasattr(args, 'output_root'): config.output_root = args.output_root
-    if hasattr(args, 'gpus'): config.gpus = args.gpus
-    if hasattr(args, 'num_frames'): config.num_frames = args.num_frames
-    
+    if hasattr(args, "run_name"):
+        config.run_name = args.run_name
+    if hasattr(args, "seed"):
+        config.seed = args.seed
+    if hasattr(args, "output_root"):
+        config.output_root = args.output_root
+    if hasattr(args, "gpus"):
+        config.gpus = args.gpus
+    if hasattr(args, "num_frames"):
+        config.num_frames = args.num_frames
+
     return config

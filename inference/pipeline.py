@@ -129,12 +129,17 @@ class HeaderDetectionPipeline:
             print(f"Candidate frames ({self.config.window_mode}): {len(candidate_frames)}")
 
             # Stage 2: Pre-XGB filtering (optional)
+            pre_xgb_probs = None
             if self.pre_filter:
                 print("\n[Stage 2] Pre-XGB Filtering...")
                 candidate_frames = self.pre_filter.filter(
                     candidate_frames,
                     ball_detections,
                     threshold=self.config.pre_xgb_threshold,
+                    fps=video_reader.fps,
+                )
+                pre_xgb_probs = self.pre_filter.get_probabilities(
+                    ball_detections,
                     fps=video_reader.fps,
                 )
 
@@ -144,6 +149,7 @@ class HeaderDetectionPipeline:
                 candidate_frames,
                 ball_detections,
                 video_reader,
+                pre_xgb_probs=pre_xgb_probs,
             )
 
             # Stage 4: Post-XGB filtering (optional)
@@ -198,6 +204,7 @@ class HeaderDetectionPipeline:
         candidate_frames: List[int],
         ball_detections: Dict[int, Dict],
         video_reader: VideoReader,
+        pre_xgb_probs: Optional[Dict[int, float]] = None,
     ) -> List[FramePrediction]:
         """Run batched CNN inference on candidate frames."""
         predictions = []
@@ -257,11 +264,16 @@ class HeaderDetectionPipeline:
                     ball_x = box[0] + box[2] / 2
                     ball_y = box[1] + box[3] / 2
 
+                pre_xgb_prob = None
+                if pre_xgb_probs is not None:
+                    pre_xgb_prob = float(pre_xgb_probs.get(center_frame, 0.0))
+
                 predictions.append(
                     FramePrediction(
                         frame_idx=center_frame,
                         prediction=int(prob >= 0.5),
                         confidence=prob,
+                        pre_xgb_prob=pre_xgb_prob,
                         cnn_prob=prob,
                         ball_detected=ball_detected,
                         ball_x=ball_x,
