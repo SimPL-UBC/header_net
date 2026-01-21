@@ -65,6 +65,7 @@ COMMON_ARGS=(
   --topk "${TOPK}"
   --negative-ratio "${NEGATIVE_RATIO}"
   --guard-frames "${GUARD_FRAMES}"
+  --seed "42"
   --window "${WINDOW_OFFSETS[@]}"
   --crop-scale-factor "${CROP_SCALE_FACTOR}"
 )

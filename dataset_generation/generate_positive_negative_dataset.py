@@ -164,6 +164,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of negatives per positive",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for negative sampling",
+    )
+    parser.add_argument(
         "--guard-frames",
         type=int,
         default=10,
@@ -372,6 +378,7 @@ def main() -> None:
         args.negative_ratio,
         args.guard_frames,
         window,
+        seed=args.seed,
     )
     print(f"[INFO] Generated {len(negatives_df)} negative samples")
 

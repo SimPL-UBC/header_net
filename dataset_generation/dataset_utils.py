@@ -513,8 +513,9 @@ def generate_negative_samples(
     negative_ratio: float,
     guard_frames: int,
     window: Sequence[int],
+    seed: int = 42,
 ) -> pd.DataFrame:
-    rng = np.random.default_rng(2024)
+    rng = np.random.default_rng(seed)
     records: List[dict] = []
 
     if window:
