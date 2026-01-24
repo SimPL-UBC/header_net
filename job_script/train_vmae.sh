@@ -15,7 +15,14 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # FINETUNE_MODE: full|frozen|partial (default: full)
 # UNFREEZE_BLOCKS: last N blocks to unfreeze (partial mode only)
 # EPOCHS, BATCH_SIZE, NUM_FRAMES, NUM_WORKERS
-# LR_BACKBONE, LR_HEAD, WEIGHT_DECAY, SEED
+# OPTIMIZER: adamw|sgd
+# BASE_LR: base learning rate (scaled by batch_size/256)
+# LAYER_LR_DECAY: layer-wise LR decay for VMAE (default: 0.75)
+# BETAS: AdamW betas (default: "0.9 0.999")
+# WEIGHT_DECAY: AdamW weight decay (default: 0.05)
+# LOSS: focal|ce
+# FOCAL_GAMMA, FOCAL_ALPHA
+# SEED
 # GPUS: space-separated GPU IDs (default: "0 1")
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
@@ -48,9 +55,14 @@ EPOCHS="${EPOCHS:-30}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 NUM_FRAMES="${NUM_FRAMES:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
-LR_BACKBONE="${LR_BACKBONE:-1e-5}"
-LR_HEAD="${LR_HEAD:-1e-3}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+OPTIMIZER="${OPTIMIZER:-adamw}"
+BASE_LR="${BASE_LR:-1e-3}"
+LAYER_LR_DECAY="${LAYER_LR_DECAY:-0.75}"
+BETAS="${BETAS:-0.9 0.999}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
+LOSS="${LOSS:-focal}"
+FOCAL_GAMMA="${FOCAL_GAMMA:-2.0}"
+FOCAL_ALPHA="${FOCAL_ALPHA:-0.75}"
 GPUS="${GPUS:-0 1}"
 SEED="${SEED:-42}"
 
@@ -67,8 +79,13 @@ SEED="${SEED:-42}"
   --num_frames "${NUM_FRAMES}" \
   --batch_size "${BATCH_SIZE}" \
   --num_workers "${NUM_WORKERS}" \
-  --lr_backbone "${LR_BACKBONE}" \
-  --lr_head "${LR_HEAD}" \
+  --optimizer "${OPTIMIZER}" \
+  --base_lr "${BASE_LR}" \
+  --layer_lr_decay "${LAYER_LR_DECAY}" \
+  --betas ${BETAS} \
   --weight_decay "${WEIGHT_DECAY}" \
+  --loss "${LOSS}" \
+  --focal_gamma "${FOCAL_GAMMA}" \
+  --focal_alpha "${FOCAL_ALPHA}" \
   --seed "${SEED}" \
   --gpus ${GPUS}

@@ -44,6 +44,37 @@ def _get_vmae_blocks(backbone):
     raise ValueError("Unable to locate transformer blocks on the VideoMAE backbone.")
 
 
+def _build_vmae_param_groups(backbone, head, base_lr, layer_lr_decay):
+    blocks = list(_get_vmae_blocks(backbone))
+    num_blocks = len(blocks)
+    param_groups = []
+    used = set()
+
+    def add_group(params, lr, name):
+        filtered = [p for p in params if p.requires_grad and id(p) not in used]
+        if not filtered:
+            return
+        used.update(id(p) for p in filtered)
+        param_groups.append({"params": filtered, "lr": lr, "name": name})
+
+    # Head gets full LR.
+    add_group(head.parameters(), base_lr, "head")
+
+    # Transformer blocks get decayed LR, last block closest to head.
+    for idx, block in enumerate(blocks):
+        depth = num_blocks - idx
+        lr = base_lr * (layer_lr_decay ** depth)
+        add_group(block.parameters(), lr, f"block_{idx}")
+
+    # Remaining backbone params (embeddings/norms) get the smallest LR.
+    remaining = [p for p in backbone.parameters() if p.requires_grad and id(p) not in used]
+    if remaining:
+        lr = base_lr * (layer_lr_decay ** (num_blocks + 1))
+        add_group(remaining, lr, "backbone_other")
+
+    return param_groups
+
+
 def build_model(config: Config):
     """
     Builds the model and parameter groups based on configuration.
@@ -54,7 +85,7 @@ def build_model(config: Config):
         
         model = build_csn_backbone(config)
         param_groups = [
-            {'params': model.parameters(), 'lr': config.lr_backbone, 'name': 'backbone'}
+            {'params': model.parameters(), 'lr': config.base_lr, 'name': 'backbone'}
         ]
         
     elif config.backbone == "vmae":
@@ -77,10 +108,10 @@ def build_model(config: Config):
                 param.requires_grad = False
             
             # Only train the head
-            param_groups = [
-                {'params': head.parameters(), 'lr': config.lr_head, 'name': 'head'}
-            ]
-            print(f"VideoMAE backbone frozen. Training only head with lr={config.lr_head}")
+            param_groups = _build_vmae_param_groups(
+                backbone, head, config.base_lr, config.layer_lr_decay
+            )
+            print(f"VideoMAE backbone frozen. Training only head with lr={config.base_lr}")
             
         elif config.finetune_mode == "partial":
             if config.unfreeze_blocks < 0:
@@ -99,28 +130,26 @@ def build_model(config: Config):
                     for param in block.parameters():
                         param.requires_grad = True
 
-            backbone_params = [p for p in backbone.parameters() if p.requires_grad]
-            param_groups = []
-            if backbone_params:
-                param_groups.append(
-                    {'params': backbone_params, 'lr': config.lr_backbone, 'name': 'backbone'}
-                )
-            param_groups.append({'params': head.parameters(), 'lr': config.lr_head, 'name': 'head'})
+            param_groups = _build_vmae_param_groups(
+                backbone, head, config.base_lr, config.layer_lr_decay
+            )
             print(
                 "VideoMAE partial fine-tuning: "
                 f"unfreeze_blocks={num_unfreeze}/{num_blocks}, "
-                f"backbone lr={config.lr_backbone}, head lr={config.lr_head}"
+                f"base lr={config.base_lr}, layer decay={config.layer_lr_decay}"
             )
 
         elif config.finetune_mode == "full":
             # Train both backbone and head (Phase 3)
             for param in backbone.parameters():
                 param.requires_grad = True
-            param_groups = [
-                {'params': backbone.parameters(), 'lr': config.lr_backbone, 'name': 'backbone'},
-                {'params': head.parameters(), 'lr': config.lr_head, 'name': 'head'}
-            ]
-            print(f"VideoMAE full fine-tuning: backbone lr={config.lr_backbone}, head lr={config.lr_head}")
+            param_groups = _build_vmae_param_groups(
+                backbone, head, config.base_lr, config.layer_lr_decay
+            )
+            print(
+                f"VideoMAE full fine-tuning: base lr={config.base_lr}, "
+                f"layer decay={config.layer_lr_decay}"
+            )
         else:
             raise ValueError(f"Unsupported finetune_mode for vmae: {config.finetune_mode}")
     else:

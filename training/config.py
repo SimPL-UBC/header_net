@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import argparse
 
 
@@ -19,19 +19,27 @@ class Config:
     backbone_ckpt: Optional[str] = None  # Path to VideoMAE checkpoint
 
     # Optimization
-    optimizer_type: str = "sgd"  # Phase 1: "sgd"
+    optimizer_type: str = "adamw"
+    base_lr: float = 1e-3
     lr_backbone: float = 0.001
     lr_head: float = 1e-3  # Learning rate for VideoMAE head
-    weight_decay: float = 1e-4
+    betas: Tuple[float, float] = (0.9, 0.999)
+    weight_decay: float = 0.05
     epochs: int = 50
     batch_size: int = 16
     num_workers: int = 8
+
+    # Loss
+    loss_type: str = "focal"
+    focal_gamma: float = 2.0
+    focal_alpha: float = 0.75
 
     # Run
     run_name: str = ""
     seed: int = 42
     output_root: str = "report/header_experiments"
     gpus: Optional[List[int]] = None
+    layer_lr_decay: float = 0.75
 
 
 def merge_cli_args(args: argparse.Namespace) -> Config:
@@ -61,8 +69,14 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.lr_backbone = args.lr_backbone
     if hasattr(args, "lr_head"):
         config.lr_head = args.lr_head
+    if hasattr(args, "base_lr"):
+        config.base_lr = args.base_lr
+    if hasattr(args, "betas"):
+        config.betas = tuple(args.betas)
     if hasattr(args, "weight_decay"):
         config.weight_decay = args.weight_decay
+    if hasattr(args, "optimizer"):
+        config.optimizer_type = args.optimizer
     if hasattr(args, "epochs"):
         config.epochs = args.epochs
     if hasattr(args, "batch_size"):
@@ -81,5 +95,13 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.gpus = args.gpus
     if hasattr(args, "num_frames"):
         config.num_frames = args.num_frames
+    if hasattr(args, "layer_lr_decay"):
+        config.layer_lr_decay = args.layer_lr_decay
+    if hasattr(args, "loss"):
+        config.loss_type = args.loss
+    if hasattr(args, "focal_gamma"):
+        config.focal_gamma = args.focal_gamma
+    if hasattr(args, "focal_alpha"):
+        config.focal_alpha = args.focal_alpha
 
     return config

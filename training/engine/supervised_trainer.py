@@ -5,14 +5,55 @@ import numpy as np
 from sklearn.metrics import f1_score
 from ..eval.metrics import compute_classification_metrics
 
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+        ce_loss = F.nll_loss(log_probs, targets, reduction="none")
+        p_t = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        focal_term = (1.0 - p_t) ** self.gamma
+        loss = focal_term * ce_loss
+
+        if self.alpha is not None:
+            if isinstance(self.alpha, (list, tuple)):
+                alpha_tensor = torch.tensor(
+                    self.alpha, device=logits.device, dtype=logits.dtype
+                )
+                alpha_t = alpha_tensor.gather(0, targets)
+            else:
+                alpha_pos = float(self.alpha)
+                alpha_t = torch.where(
+                    targets == 1,
+                    torch.tensor(alpha_pos, device=logits.device, dtype=logits.dtype),
+                    torch.tensor(1.0 - alpha_pos, device=logits.device, dtype=logits.dtype),
+                )
+            loss = loss * alpha_t
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
 class Trainer:
     def __init__(self, config, device):
         self.config = config
         self.device = device
-        # Use CrossEntropyLoss. 
-        # Note: train_header.py uses class weights, but we don't have them in config yet.
-        # For Phase 1 baseline, standard CE is fine, or we could add weights if provided.
-        self.criterion = nn.CrossEntropyLoss()
+        if getattr(config, "loss_type", "focal") == "focal":
+            self.criterion = FocalLoss(
+                gamma=getattr(config, "focal_gamma", 2.0),
+                alpha=getattr(config, "focal_alpha", 0.75),
+            )
+        else:
+            self.criterion = nn.CrossEntropyLoss()
 
     def train_one_epoch(self, model, train_loader, optimizer, epoch):
         model.train()

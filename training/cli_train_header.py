@@ -50,15 +50,50 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of workers")
     parser.add_argument(
+        "--optimizer",
+        default="adamw",
+        choices=["adamw", "sgd"],
+        help="Optimizer type",
+    )
+    parser.add_argument("--base_lr", type=float, default=1e-3, help="Base learning rate")
+    parser.add_argument(
         "--lr_backbone", type=float, default=1e-4, help="Learning rate for backbone"
     )
     parser.add_argument(
         "--lr_head", type=float, default=1e-3, help="Learning rate for head"
     )
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
+    parser.add_argument(
+        "--betas",
+        type=float,
+        nargs=2,
+        default=(0.9, 0.999),
+        help="AdamW betas",
+    )
+    parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--num_frames", type=int, default=16, help="Number of frames per clip"
+    )
+    parser.add_argument(
+        "--layer_lr_decay",
+        type=float,
+        default=0.75,
+        help="Layer-wise learning rate decay for VideoMAE",
+    )
+    parser.add_argument(
+        "--loss",
+        default="focal",
+        choices=["focal", "ce"],
+        help="Loss function type",
+    )
+    parser.add_argument(
+        "--focal_gamma", type=float, default=2.0, help="Focal loss gamma"
+    )
+    parser.add_argument(
+        "--focal_alpha",
+        type=float,
+        default=0.75,
+        help="Focal loss alpha (positive class weight)",
     )
     parser.add_argument("--gpus", type=int, nargs="+", help="GPU IDs")
     return parser.parse_args()
@@ -68,6 +103,12 @@ def main():
     args = parse_args()
     config = merge_cli_args(args)
 
+    scale = config.batch_size / 256.0
+    scaled_lr = config.base_lr * scale
+    config.base_lr = scaled_lr
+    config.lr_backbone = scaled_lr
+    config.lr_head = scaled_lr
+
     # Initialize run
     set_seed(config.seed)
     run_dir = create_run_dir(config.output_root, config.run_name)
@@ -75,6 +116,7 @@ def main():
 
     print(f"Starting run: {config.run_name}")
     print(f"Output directory: {run_dir}")
+    print(f"Base LR scaled: {args.base_lr} * ({config.batch_size}/256) = {scaled_lr:.6g}")
 
     # Device
     if config.gpus and torch.cuda.is_available():
@@ -99,7 +141,13 @@ def main():
         model = torch.nn.DataParallel(model, device_ids=config.gpus)
 
     # Optimizer
-    if config.optimizer_type == "sgd":
+    if config.optimizer_type == "adamw":
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            betas=config.betas,
+            weight_decay=config.weight_decay,
+        )
+    elif config.optimizer_type == "sgd":
         optimizer = torch.optim.SGD(
             param_groups, momentum=0.9, weight_decay=config.weight_decay
         )
