@@ -11,6 +11,8 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # OUTPUT_DIR: output directory for models/results (default: output/pre_xgb/train)
 # NEG_RATIO: negative:positive sampling ratio (default: 3.0)
 # N_FOLDS: number of CV folds (default: 5)
+# N_ESTIMATORS: number of boosting rounds (default: 100)
+# N_JOBS: number of parallel threads for XGBoost (default: 1)
 # THRESHOLD: proposal threshold (ball_det_dict mode only; default: 0.3)
 # MAX_PROPOSALS_PER_MIN: proposal cap (ball_det_dict mode only; default: 5)
 # DISABLE_PLAYER_FEATURES: set to 1 to pass --no_player_features (default: 0)
@@ -38,6 +40,8 @@ METADATA_DIR="${METADATA_DIR:-${REPO_ROOT}/output/dataset_generation/train}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/output/pre_xgb/train}"
 NEG_RATIO="${NEG_RATIO:-3.0}"
 N_FOLDS="${N_FOLDS:-5}"
+N_ESTIMATORS="${N_ESTIMATORS:-100}"
+N_JOBS="${N_JOBS:-1}"
 THRESHOLD="${THRESHOLD:-0.3}"
 MAX_PROPOSALS_PER_MIN="${MAX_PROPOSALS_PER_MIN:-5}"
 DISABLE_PLAYER_FEATURES="${DISABLE_PLAYER_FEATURES:-0}"
@@ -49,6 +53,8 @@ PREXGB_ARGS=(
   --output_dir "${OUTPUT_DIR}"
   --neg_ratio "${NEG_RATIO}"
   --n_folds "${N_FOLDS}"
+  --n_estimators "${N_ESTIMATORS}"
+  --n_jobs "${N_JOBS}"
   --threshold "${THRESHOLD}"
   --max_proposals_per_min "${MAX_PROPOSALS_PER_MIN}"
 )
@@ -59,7 +65,3 @@ fi
 
 "${PYTHON_BIN}" "${REPO_ROOT}/tree/pre_xgb.py" \
   "${PREXGB_ARGS[@]}"
-  --metadata_dir "${METADATA_DIR}" \
-  --output_dir "${OUTPUT_DIR}" \
-  --neg_ratio "${NEG_RATIO}" \
-  --n_folds "${N_FOLDS}"

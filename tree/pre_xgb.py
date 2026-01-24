@@ -478,7 +478,7 @@ def create_training_data(ball_det_dict, labels_df, neg_sampling_ratio=3.0):
 
     return X, y, metadata, feature_names
 
-def train_pre_xgb(X, y, feature_names, output_dir, n_folds=5):
+def train_pre_xgb(X, y, feature_names, output_dir, n_folds=5, n_estimators=100, n_jobs=1):
     """Train XGB prefilter with cross-validation"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -491,8 +491,8 @@ def train_pre_xgb(X, y, feature_names, output_dir, n_folds=5):
         'subsample': 0.8,
         'colsample_bytree': 0.8,
         'random_state': 42,
-        'n_estimators': 100,
-        'n_jobs': 1
+        'n_estimators': n_estimators,
+        'n_jobs': n_jobs
     }
 
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
@@ -631,6 +631,10 @@ def main():
                         help='Maximum proposals per minute of video')
     parser.add_argument('--n_folds', type=int, default=5,
                         help='Number of CV folds')
+    parser.add_argument('--n_estimators', type=int, default=100,
+                        help='Number of boosting rounds (trees)')
+    parser.add_argument('--n_jobs', type=int, default=1,
+                        help='Number of parallel threads for XGBoost')
 
     args = parser.parse_args()
 
@@ -698,7 +702,13 @@ def main():
 
     # Train model
     final_model, fold_models, cv_scores = train_pre_xgb(
-        X, y, feature_names, output_dir, args.n_folds
+        X,
+        y,
+        feature_names,
+        output_dir,
+        args.n_folds,
+        n_estimators=args.n_estimators,
+        n_jobs=args.n_jobs,
     )
 
     # Generate proposals (only in ball_det_dict mode for now)

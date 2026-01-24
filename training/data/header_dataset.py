@@ -98,15 +98,9 @@ class HeaderCacheDataset(Dataset):
         return indices
 
 def get_transforms(input_size=224, is_training=True, backbone="csn"):
-    # Use backbone-specific normalization:
-    # - VideoMAE: mean/std = [0.5, 0.5, 0.5]
-    # - CSN: ImageNet mean/std
-    if backbone == "vmae":
-        normalize = T.Normalize(mean=[0.5, 0.5, 0.5],
-                                std=[0.5, 0.5, 0.5])
-    else:  # csn
-        normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225])
+    # Use ImageNet normalization for both backbones.
+    normalize = T.Normalize(mean=[0.485, 0.456, 0.406],
+                            std=[0.229, 0.224, 0.225])
     
     if is_training:
         return T.Compose([

@@ -37,7 +37,7 @@ if [[ -z "${PYTHON_BIN}" ]]; then
   exit 1
 fi
 
-TRAIN_CSV="${TRAIN_CSV:-${REPO_ROOT}/output/dataset_generation/train/train_cache_header.csv}"
+TRAIN_CSV="${TRAIN_CSV:-${REPO_ROOT}/output/dataset_generation/train_aug/train_with_aug.csv}"
 VAL_CSV="${VAL_CSV:-${REPO_ROOT}/output/dataset_generation/val/val_cache_header.csv}"
 BACKBONE_CKPT="${BACKBONE_CKPT:-${REPO_ROOT}/checkpoints/VideoMAEv2-Base}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/output/vmae}"
