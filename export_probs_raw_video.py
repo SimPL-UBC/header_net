@@ -70,7 +70,7 @@ class ExportConfig:
 
     # Pre-XGB model
     pre_xgb_model: Path = field(default_factory=Path)
-    pre_xgb_threshold: float = 0.3
+    pre_xgb_threshold: float = 0.2
 
     # Frame selection
     mode: str = "ball_only"  # ball_only or every_n

@@ -28,12 +28,9 @@ class FocalLoss(nn.Module):
                 )
                 alpha_t = alpha_tensor.gather(0, targets)
             else:
+                # Use scalars directly - PyTorch handles broadcasting without allocating new tensors
                 alpha_pos = float(self.alpha)
-                alpha_t = torch.where(
-                    targets == 1,
-                    torch.tensor(alpha_pos, device=logits.device, dtype=logits.dtype),
-                    torch.tensor(1.0 - alpha_pos, device=logits.device, dtype=logits.dtype),
-                )
+                alpha_t = torch.where(targets == 1, alpha_pos, 1.0 - alpha_pos)
             loss = loss * alpha_t
 
         if self.reduction == "mean":

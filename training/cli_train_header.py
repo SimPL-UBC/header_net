@@ -192,10 +192,15 @@ def main():
         )
 
         # Save metrics
+        # For CSN, backbone params are in "backbone" group
+        # For VMAE, backbone params are split across "block_0", "block_1", ..., "backbone_other"
         lr_backbone = get_group_lr(optimizer, "backbone")
-        lr_head = get_group_lr(optimizer, "head")
+        if lr_backbone is None:
+            # Try VMAE naming: use first block LR as representative backbone LR
+            lr_backbone = get_group_lr(optimizer, "block_0")
         if lr_backbone is None:
             lr_backbone = config.lr_backbone
+        lr_head = get_group_lr(optimizer, "head")
         if lr_head is None:
             lr_head = 0.0
 
