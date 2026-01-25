@@ -7,8 +7,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Env overrides:
-# DATASET_ROOT: SoccerNet validation videos (default: SoccerNet/val)
-# LABELS_DIR: Ground truth labels directory (default: SoccerNet/val/labelled_header)
+# DATASET_ROOT: Parent directory containing SoccerNet/ folder with videos
+#               Expected structure: DATASET_ROOT/SoccerNet/league/season/match/*.mp4
+#               For validation only, point to the val split parent (default: ../DeepImpact)
+# LABELS_DIR: Ground truth labels directory (default: ../SoccerNet/val/labelled_header)
 # PRE_XGB_MODEL: Pre-XGB model path (default: output/pre_xgb/train/pre_xgb_final.pkl)
 # VMAE_RUN_DIR: VMAE trained run directory (default: output/vmae/vmae_full_base)
 # BACKBONE_CKPT: VideoMAE pretrained weights (default: checkpoints/VideoMAEv2-Base)
@@ -19,6 +21,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # BATCH_SIZE: Inference batch size (default: 4)
 # N_FOLDS: Number of CV folds (default: 5)
 # PRE_XGB_THRESHOLD: Pre-XGB threshold for naming (default: 0.2)
+# DEVICE: GPU device for inference, e.g., cuda:0 or cuda:1 (default: cuda:0)
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 if [[ ! -f "${CONDA_SH}" ]]; then
@@ -40,7 +43,9 @@ if [[ -z "${PYTHON_BIN}" ]]; then
 fi
 
 # Default paths
-DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/../SoccerNet/val}"
+# DATASET_ROOT should be the parent directory containing SoccerNet/
+# The function looks for: DATASET_ROOT/SoccerNet/{train,val,test}/league/season/match/*.mp4
+DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/..}"
 LABELS_DIR="${LABELS_DIR:-${REPO_ROOT}/../SoccerNet/val/labelled_header}"
 PRE_XGB_MODEL="${PRE_XGB_MODEL:-${REPO_ROOT}/output/pre_xgb/train/pre_xgb_final.pkl}"
 VMAE_RUN_DIR="${VMAE_RUN_DIR:-${REPO_ROOT}/output/vmae/vmae_full_base}"
@@ -52,6 +57,7 @@ WINDOW_STRIDE="${WINDOW_STRIDE:-5}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 N_FOLDS="${N_FOLDS:-5}"
 PRE_XGB_THRESHOLD="${PRE_XGB_THRESHOLD:-0.2}"
+DEVICE="${DEVICE:-cuda:0}"
 
 # Validate required files
 if [[ ! -f "${PRE_XGB_MODEL}" ]]; then
@@ -113,6 +119,7 @@ echo "Window stride:     ${WINDOW_STRIDE}"
 echo "Batch size:        ${BATCH_SIZE}"
 echo "CV folds:          ${N_FOLDS}"
 echo "Pre-XGB threshold: ${PRE_XGB_THRESHOLD}"
+echo "Device:            ${DEVICE}"
 echo "============================================================"
 echo ""
 
@@ -123,6 +130,7 @@ echo ""
 
 EXPORT_ARGS=(
   --dataset_root "${DATASET_ROOT}"
+  --split val
   --backbone vmae
   --checkpoint "${VMAE_CHECKPOINT}"
   --backbone_ckpt "${BACKBONE_CKPT}"
@@ -130,6 +138,7 @@ EXPORT_ARGS=(
   --pre_xgb_threshold "${PRE_XGB_THRESHOLD}"
   --mode "${MODE}"
   --batch_size "${BATCH_SIZE}"
+  --device "${DEVICE}"
   --output "${PROBS_CSV}"
 )
 

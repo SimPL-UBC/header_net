@@ -62,6 +62,7 @@ class ExportConfig:
     input_csv: Optional[Path] = None
     videos: Optional[List[str]] = None
     dataset_root: Path = field(default_factory=Path)
+    split: Optional[str] = None  # train, val, or test
 
     # CNN/VMAE model
     backbone: str = "vmae"
@@ -490,6 +491,13 @@ Examples:
         required=True,
         help="Raw video root for SoccerNet structure",
     )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        choices=["train", "val", "test"],
+        help="Filter to specific split (train/val/test). If None, process all.",
+    )
 
     # CNN/VMAE model
     parser.add_argument(
@@ -595,6 +603,7 @@ Examples:
         input_csv=Path(args.input_csv) if args.input_csv else None,
         videos=args.videos,
         dataset_root=Path(args.dataset_root),
+        split=args.split,
         backbone=args.backbone,
         checkpoint=Path(args.checkpoint),
         backbone_ckpt=Path(args.backbone_ckpt) if args.backbone_ckpt else None,
@@ -631,6 +640,16 @@ Examples:
     if config.videos:
         # Filter to requested videos
         sources = {k: v for k, v in sources.items() if k in config.videos}
+
+    if config.split:
+        # Filter to specific split (train/val/test)
+        # Video paths are like: SoccerNet/val/league/season/match/1.mp4
+        split_filter = f"/{config.split}/"
+        sources = {
+            k: v for k, v in sources.items()
+            if split_filter in str(v.path)
+        }
+        print(f"Filtered to {config.split} split: {len(sources)} videos")
 
     print(f"Found {len(sources)} video sources")
 

@@ -16,14 +16,12 @@ from sklearn.model_selection import KFold
 from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
 import xgboost as xgb
 
-# Add paths
-sys.path.append('../configs')
-from header_default import *
-
+# Add paths relative to script location
 HEADER_NET_ROOT = Path(__file__).resolve().parents[1]
 if str(HEADER_NET_ROOT) not in sys.path:
-    sys.path.append(str(HEADER_NET_ROOT))
+    sys.path.insert(0, str(HEADER_NET_ROOT))
 
+from configs.header_default import *
 from utils.detections import make_video_key
 
 def load_probabilities(probs_path):
