@@ -37,7 +37,7 @@ HEADER_NET_ROOT = Path(__file__).resolve().parent
 if str(HEADER_NET_ROOT) not in sys.path:
     sys.path.insert(0, str(HEADER_NET_ROOT))
 
-from cache.create_cache_header import discover_video_sources, VideoSource
+from dataset_generation.dataset_utils import discover_video_sources, VideoSource
 from inference.preprocessing.video_reader import VideoReader
 from inference.preprocessing.frame_cropper import FrameCropper
 from inference.stages.model_inference import CNNInference
@@ -81,6 +81,10 @@ class ExportConfig:
     # TODO change it to fine-tuned RF-DETR
     rf_detr_weights: Optional[Path] = None
     rf_detr_variant: str = "medium"
+    rf_detr_label_mode: str = "coco"
+    rf_detr_optimize: bool = False
+    rf_detr_optimize_batch_size: int = 1
+    rf_detr_optimize_compile: bool = False
     ball_conf_threshold: float = 0.3
 
     # Processing
@@ -88,6 +92,7 @@ class ExportConfig:
     batch_size: int = 4
     num_frames: int = 16
     input_size: int = 224
+    min_decode_ratio: float = 0.5
 
 
 def load_pre_xgb_model(model_path: Path) -> Tuple:
@@ -119,9 +124,11 @@ def load_pre_xgb_model(model_path: Path) -> Tuple:
 def run_ball_detection(
     video_reader: VideoReader,
     rf_detr: RFDetrInference,
+    ball_class_ids: set[int],
+    player_class_ids: set[int],
     ball_conf_threshold: float,
     batch_size: int = 4,
-) -> Tuple[Dict[int, Dict], Dict[int, List[Dict]]]:
+) -> Tuple[Dict[int, Dict], Dict[int, List[Dict]], int, int]:
     """Run RF-DETR ball and player detection on all frames.
 
     Args:
@@ -140,6 +147,9 @@ def run_ball_detection(
 
     frame_count = video_reader.frame_count
 
+    attempted = 0
+    decoded = 0
+
     for batch_start in tqdm(
         range(0, frame_count, batch_size),
         desc="Ball detection",
@@ -148,12 +158,14 @@ def run_ball_detection(
     ):
         batch_end = min(batch_start + batch_size, frame_count)
         frame_indices = list(range(batch_start, batch_end))
+        attempted += len(frame_indices)
 
         # Load frames
         frames = [video_reader.get_frame(idx) for idx in frame_indices]
         valid_frames = [
             (idx, f) for idx, f in zip(frame_indices, frames) if f is not None
         ]
+        decoded += len(valid_frames)
 
         if not valid_frames:
             continue
@@ -170,11 +182,10 @@ def run_ball_detection(
 
             for det in dets:
                 class_id = det.get("class_id", -1)
-                # COCO class 32 = sports ball, class 0 = person
-                if class_id == 32:  # sports ball
+                if class_id in ball_class_ids:
                     if ball_det is None or det["confidence"] > ball_det["confidence"]:
                         ball_det = det
-                elif class_id == 0:  # person
+                elif class_id in player_class_ids:
                     players.append(det)
 
             if ball_det is not None:
@@ -183,7 +194,7 @@ def run_ball_detection(
                 player_detections[idx] = players
 
     print(f"  Detected ball in {len(ball_detections)}/{frame_count} frames")
-    return ball_detections, player_detections
+    return ball_detections, player_detections, attempted, decoded
 
 
 def get_candidate_frames(
@@ -360,7 +371,7 @@ def process_video(
     pre_xgb_feature_names: List[str],
     cnn_inference: CNNInference,
     frame_cropper: FrameCropper,
-) -> List[Dict]:
+) -> Tuple[List[Dict], Dict[str, object]]:
     """Process a single video and return probability records.
 
     Args:
@@ -375,17 +386,42 @@ def process_video(
     Returns:
         List of dicts with video_id, frame_id, cnn_prob, pre_xgb_prob
     """
-    records = []
+    records: List[Dict] = []
+    failure: Dict[str, object] = {}
 
     with VideoReader(video_source.path) as video_reader:
         # Step 1: Ball and player detection
-        ball_detections, player_detections = run_ball_detection(
-            video_reader, rf_detr, config.ball_conf_threshold, config.batch_size
+        if config.rf_detr_label_mode == "soccernet":
+            ball_ids = {0}
+            player_ids = {1, 2, 3}
+        else:
+            ball_ids = {32}
+            player_ids = {0}
+
+        ball_detections, player_detections, attempted, decoded = run_ball_detection(
+            video_reader,
+            rf_detr,
+            ball_ids,
+            player_ids,
+            config.ball_conf_threshold,
+            config.batch_size,
         )
+
+        read_ratio = (decoded / attempted) if attempted else 0.0
+        if attempted == 0 or read_ratio < config.min_decode_ratio:
+            failure = {
+                "video_id": video_source.key,
+                "path": str(video_source.path),
+                "attempted_frames": attempted,
+                "decoded_frames": decoded,
+                "decoded_ratio": round(read_ratio, 4),
+                "reason": "decode_rate_below_threshold",
+            }
+            return [], failure
 
         if not ball_detections:
             print(f"  No ball detections in {video_source.key}")
-            return []
+            return [], failure
 
         # Step 2: Get candidate frames
         candidate_frames = get_candidate_frames(
@@ -397,7 +433,7 @@ def process_video(
 
         if not candidate_frames:
             print(f"  No candidate frames in {video_source.key}")
-            return []
+            return [], failure
 
         print(f"  {len(candidate_frames)} candidate frames")
 
@@ -436,7 +472,7 @@ def process_video(
                 }
             )
 
-    return records
+    return records, failure
 
 
 def main():
@@ -557,11 +593,34 @@ Examples:
         help="Path to RF-DETR weights (uses default medium if None)",
     )
     parser.add_argument(
+        "--rf_detr_label_mode",
+        type=str,
+        default="coco",
+        choices=["coco", "soccernet"],
+        help="RF-DETR label mode (default: coco)",
+    )
+    parser.add_argument(
         "--rf_detr_variant",
         type=str,
         default="medium",
         choices=["nano", "small", "medium", "base", "large"],
         help="RF-DETR model variant (default: medium)",
+    )
+    parser.add_argument(
+        "--rf_detr_optimize",
+        action="store_true",
+        help="Enable RF-DETR optimize_for_inference",
+    )
+    parser.add_argument(
+        "--rf_detr_optimize_batch_size",
+        type=int,
+        default=1,
+        help="Batch size for RF-DETR optimization",
+    )
+    parser.add_argument(
+        "--rf_detr_optimize_compile",
+        action="store_true",
+        help="Enable torch.compile during RF-DETR optimization",
     )
     parser.add_argument(
         "--ball_conf_threshold",
@@ -583,7 +642,19 @@ Examples:
         default=4,
         help="Batch size for inference (default: 4)",
     )
+    parser.add_argument(
+        "--min_decode_ratio",
+        type=float,
+        default=0.5,
+        help="Minimum decoded frame ratio required to process a video",
+    )
     parser.add_argument("--output", type=str, required=True, help="Output CSV path")
+    parser.add_argument(
+        "--failed_log",
+        type=str,
+        default=None,
+        help="Optional CSV path to log failed videos",
+    )
 
     args = parser.parse_args()
 
@@ -613,9 +684,14 @@ Examples:
         window_stride=args.window_stride,
         rf_detr_weights=Path(args.rf_detr_weights) if args.rf_detr_weights else None,
         rf_detr_variant=args.rf_detr_variant,
+        rf_detr_label_mode=args.rf_detr_label_mode,
+        rf_detr_optimize=args.rf_detr_optimize,
+        rf_detr_optimize_batch_size=args.rf_detr_optimize_batch_size,
+        rf_detr_optimize_compile=args.rf_detr_optimize_compile,
         ball_conf_threshold=args.ball_conf_threshold,
         device=str(device),
         batch_size=args.batch_size,
+        min_decode_ratio=args.min_decode_ratio,
     )
 
     # Discover video sources
@@ -655,17 +731,27 @@ Examples:
 
     if not sources:
         print("No videos found!")
-        return
+        raise SystemExit(1)
 
     # Initialize models
     print("\nInitializing models...")
 
     # RF-DETR for ball + player detection
+    target_class_names = ("sports ball", "person")
+    target_class_ids = None
+    if config.rf_detr_label_mode == "soccernet":
+        target_class_names = ()
+        target_class_ids = (0, 1, 2, 3)
+
     rf_detr_config = RFDetrConfig(
         variant=config.rf_detr_variant,
         weights_path=str(config.rf_detr_weights) if config.rf_detr_weights else None,
         device=config.device,
-        target_class_names=("sports ball", "person"),  # Detect both
+        target_class_names=target_class_names,
+        target_class_ids=target_class_ids,
+        optimize=config.rf_detr_optimize,
+        optimize_batch_size=config.rf_detr_optimize_batch_size,
+        optimize_compile=config.rf_detr_optimize_compile,
     )
     rf_detr_model = build_rf_detr(rf_detr_config)
     rf_detr = RFDetrInference(rf_detr_model, rf_detr_config)
@@ -691,11 +777,12 @@ Examples:
 
     # Process videos
     print(f"\nProcessing {len(sources)} videos...")
-    all_records = []
+    all_records: List[Dict] = []
+    failed_records: List[Dict[str, object]] = []
 
     for key, source in tqdm(sources.items(), desc="Videos"):
         print(f"\nProcessing {key}...")
-        records = process_video(
+        records, failure = process_video(
             source,
             config,
             rf_detr,
@@ -704,6 +791,14 @@ Examples:
             cnn_inference,
             frame_cropper,
         )
+        if failure:
+            failed_records.append(failure)
+            print(
+                f"[WARN] Skipping {source.key}: decoded "
+                f"{failure.get('decoded_frames')}/{failure.get('attempted_frames')} "
+                f"frames ({failure.get('decoded_ratio'):.2%})"
+            )
+            continue
         all_records.extend(records)
 
     # Save output
@@ -711,6 +806,15 @@ Examples:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_df.to_csv(output_path, index=False)
+
+    if failed_records:
+        failed_path = (
+            Path(args.failed_log)
+            if args.failed_log
+            else output_path.parent / "failed_videos.csv"
+        )
+        pd.DataFrame(failed_records).to_csv(failed_path, index=False)
+        print(f"[WARN] Logged {len(failed_records)} failed videos to {failed_path}")
 
     print(f"\n{'=' * 60}")
     print(f"Exported {len(output_df)} probability records to {output_path}")

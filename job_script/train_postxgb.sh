@@ -8,19 +8,24 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Env overrides:
 # DATASET_ROOT: Parent directory containing SoccerNet/ folder with videos
-#               Expected structure: DATASET_ROOT/SoccerNet/league/season/match/*.mp4
-#               For validation only, point to the val split parent (default: ../DeepImpact)
-# LABELS_DIR: Ground truth labels directory (default: ../SoccerNet/val/labelled_header)
+#               Expected structure: DATASET_ROOT/SoccerNet/<split>/<match>/*.mp4 (or deeper)
+# LABELS_DIR: Ground truth labels directory (default: DATASET_ROOT/SoccerNet/val/labelled_header)
 # PRE_XGB_MODEL: Pre-XGB model path (default: output/pre_xgb/train/pre_xgb_final.pkl)
 # VMAE_RUN_DIR: VMAE trained run directory (default: output/vmae/vmae_full_base)
 # BACKBONE_CKPT: VideoMAE pretrained weights (default: checkpoints/VideoMAEv2-Base)
 # RF_DETR_WEIGHTS: RF-DETR weights (optional)
+# RF_DETR_LABEL_MODE: coco|soccernet (default: soccernet if weights set)
+# RF_DETR_VARIANT: RF-DETR variant (default: large)
+# RF_DETR_OPTIMIZE: set to 1 to enable optimize_for_inference (default: 1)
+# RF_DETR_OPTIMIZE_BATCH_SIZE: batch size for optimization (default: 8)
+# RF_DETR_OPTIMIZE_COMPILE: set to 1 to enable torch.compile (default: 0)
 # OUTPUT_DIR: Output directory (default: output/post_xgb)
 # MODE: Frame selection mode - ball_only or every_n (default: ball_only)
 # WINDOW_STRIDE: Frame stride for every_n mode (default: 5)
 # BATCH_SIZE: Inference batch size (default: 4)
 # N_FOLDS: Number of CV folds (default: 5)
 # PRE_XGB_THRESHOLD: Pre-XGB threshold for naming (default: 0.2)
+# MIN_DECODE_RATIO: Minimum decoded frame ratio to keep a video (default: 0.5)
 # DEVICE: GPU device for inference, e.g., cuda:0 or cuda:1 (default: cuda:0)
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
@@ -43,20 +48,36 @@ if [[ -z "${PYTHON_BIN}" ]]; then
 fi
 
 # Default paths
-# DATASET_ROOT should be the parent directory containing SoccerNet/
-# The function looks for: DATASET_ROOT/SoccerNet/{train,val,test}/league/season/match/*.mp4
-DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/..}"
-LABELS_DIR="${LABELS_DIR:-${REPO_ROOT}/../SoccerNet/val/labelled_header}"
+if [[ -z "${DATASET_ROOT:-}" ]]; then
+  if [[ -d "${REPO_ROOT}/SoccerNet" ]]; then
+    DATASET_ROOT="${REPO_ROOT}"
+  elif [[ -d "${REPO_ROOT}/../SoccerNet" ]]; then
+    DATASET_ROOT="${REPO_ROOT}/.."
+  else
+    DATASET_ROOT="${REPO_ROOT}"
+  fi
+fi
+
+if [[ -z "${LABELS_DIR:-}" ]]; then
+  LABELS_DIR="${DATASET_ROOT}/SoccerNet/val/labelled_header"
+fi
+
 PRE_XGB_MODEL="${PRE_XGB_MODEL:-${REPO_ROOT}/output/pre_xgb/train/pre_xgb_final.pkl}"
 VMAE_RUN_DIR="${VMAE_RUN_DIR:-${REPO_ROOT}/output/vmae/vmae_full_base}"
 BACKBONE_CKPT="${BACKBONE_CKPT:-${REPO_ROOT}/checkpoints/VideoMAEv2-Base}"
-RF_DETR_WEIGHTS="${RF_DETR_WEIGHTS:-${REPO_ROOT}/rf-detr-medium.pth}"
+RF_DETR_WEIGHTS="${RF_DETR_WEIGHTS:-${REPO_ROOT}/RFDETR-Soccernet/weights/checkpoint_best_regular.pth}"
+RF_DETR_LABEL_MODE="${RF_DETR_LABEL_MODE:-soccernet}"
+RF_DETR_VARIANT="${RF_DETR_VARIANT:-large}"
+RF_DETR_OPTIMIZE="${RF_DETR_OPTIMIZE:-1}"
+RF_DETR_OPTIMIZE_BATCH_SIZE="${RF_DETR_OPTIMIZE_BATCH_SIZE:-8}"
+RF_DETR_OPTIMIZE_COMPILE="${RF_DETR_OPTIMIZE_COMPILE:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/output/post_xgb}"
 MODE="${MODE:-ball_only}"
 WINDOW_STRIDE="${WINDOW_STRIDE:-5}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 N_FOLDS="${N_FOLDS:-5}"
 PRE_XGB_THRESHOLD="${PRE_XGB_THRESHOLD:-0.2}"
+MIN_DECODE_RATIO="${MIN_DECODE_RATIO:-0.5}"
 DEVICE="${DEVICE:-cuda:0}"
 
 # Validate required files
@@ -90,6 +111,11 @@ if [[ ! -f "${VMAE_CHECKPOINT}" ]]; then
   exit 1
 fi
 
+if [[ ! -f "${RF_DETR_WEIGHTS}" ]]; then
+  echo "[ERROR] RF-DETR weights not found: ${RF_DETR_WEIGHTS}" >&2
+  exit 1
+fi
+
 echo "Using VMAE checkpoint: ${VMAE_CHECKPOINT}"
 
 # Create output directory
@@ -113,6 +139,9 @@ echo "VMAE run dir:      ${VMAE_RUN_DIR}"
 echo "VMAE checkpoint:   ${VMAE_CHECKPOINT}"
 echo "Backbone ckpt:     ${BACKBONE_CKPT}"
 echo "RF-DETR weights:   ${RF_DETR_WEIGHTS}"
+echo "RF-DETR mode:      ${RF_DETR_LABEL_MODE}"
+echo "RF-DETR variant:   ${RF_DETR_VARIANT}"
+echo "RF-DETR optimize:  ${RF_DETR_OPTIMIZE}"
 echo "Output directory:  ${OUTPUT_DIR}"
 echo "Mode:              ${MODE}"
 echo "Window stride:     ${WINDOW_STRIDE}"
@@ -140,11 +169,22 @@ EXPORT_ARGS=(
   --batch_size "${BATCH_SIZE}"
   --device "${DEVICE}"
   --output "${PROBS_CSV}"
+  --min_decode_ratio "${MIN_DECODE_RATIO}"
+  --rf_detr_label_mode "${RF_DETR_LABEL_MODE}"
+  --rf_detr_variant "${RF_DETR_VARIANT}"
+  --rf_detr_optimize_batch_size "${RF_DETR_OPTIMIZE_BATCH_SIZE}"
 )
 
 # Add optional RF-DETR weights
 if [[ -f "${RF_DETR_WEIGHTS}" ]]; then
   EXPORT_ARGS+=(--rf_detr_weights "${RF_DETR_WEIGHTS}")
+fi
+
+if [[ "${RF_DETR_OPTIMIZE}" == "1" ]]; then
+  EXPORT_ARGS+=(--rf_detr_optimize)
+  if [[ "${RF_DETR_OPTIMIZE_COMPILE}" == "1" ]]; then
+    EXPORT_ARGS+=(--rf_detr_optimize_compile)
+  fi
 fi
 
 # Add stride for every_n mode
@@ -154,6 +194,11 @@ fi
 
 "${PYTHON_BIN}" "${REPO_ROOT}/export_probs_raw_video.py" \
   "${EXPORT_ARGS[@]}"
+
+if [[ ! -f "${PROBS_CSV}" ]]; then
+  echo "[ERROR] Probabilities CSV not created: ${PROBS_CSV}" >&2
+  exit 1
+fi
 
 echo ""
 echo "Step 1 complete: Probabilities exported to ${PROBS_CSV}"
