@@ -10,6 +10,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # DATASET_ROOT: Parent directory containing SoccerNet/ folder with videos
 #               Expected structure: DATASET_ROOT/SoccerNet/<split>/<match>/*.mp4 (or deeper)
 # LABELS_DIR: Ground truth labels directory (default: DATASET_ROOT/SoccerNet/val/labelled_header)
+#             Directory should contain match subfolders with .xlsx/.csv labels (frame in column 2)
 # PRE_XGB_MODEL: Pre-XGB model path (default: output/pre_xgb/train/pre_xgb_final.pkl)
 # VMAE_RUN_DIR: VMAE trained run directory (default: output/vmae/vmae_full_base)
 # BACKBONE_CKPT: VideoMAE pretrained weights (default: checkpoints/VideoMAEv2-Base)

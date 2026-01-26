@@ -23,6 +23,8 @@ if str(HEADER_NET_ROOT) not in sys.path:
 
 from configs.header_default import *
 from utils.detections import make_video_key
+from utils.labels import canonical_match_name
+from utils.videos import infer_half_from_stem
 
 def load_probabilities(probs_path):
     """Load CNN and pre-XGB probabilities from CSV (no ensemble).
@@ -177,59 +179,106 @@ def build_temporal_features(probs_df, window_size=15):
 
     return temporal_df
 
-def load_ground_truth_labels_from_csv(label_paths):
-    """Load ground truth header labels from dataset_generation CSVs."""
-    if not label_paths:
-        return {}
-
+def _load_labels_from_cache_csv(paths):
     labels = {}
-    paths = []
-
-    for path in label_paths:
-        path_obj = Path(path)
-        if path_obj.is_dir():
-            paths.extend(sorted(path_obj.glob("*.csv")))
-        else:
-            paths.append(path_obj)
-
     for csv_path in paths:
         if not csv_path.exists():
             print(f"Warning: labels CSV not found: {csv_path}")
             continue
 
         df = pd.read_csv(csv_path)
-        if 'label' not in df.columns:
+        if "label" not in df.columns:
             print(f"Warning: skipping {csv_path} (missing label column)")
             continue
 
-        frame_col = 'frame' if 'frame' in df.columns else 'frame_id' if 'frame_id' in df.columns else None
-        if frame_col is None or 'video_id' not in df.columns:
+        frame_col = (
+            "frame" if "frame" in df.columns else "frame_id" if "frame_id" in df.columns else None
+        )
+        if frame_col is None or "video_id" not in df.columns:
             print(f"Warning: skipping {csv_path} (missing frame/video columns)")
             continue
 
-        positive_df = df[df['label'] == 1]
+        positive_df = df[df["label"] == 1]
         if positive_df.empty:
             continue
 
-        if 'half' in positive_df.columns:
+        if "half" in positive_df.columns:
             def build_key(row):
-                raw_video = str(row['video_id'])
-                if '_half' in raw_video:
+                raw_video = str(row["video_id"])
+                if "_half" in raw_video:
                     return raw_video
-                return make_video_key(raw_video, row['half'])
+                return make_video_key(raw_video, row["half"])
 
             positive_df = positive_df.copy()
-            positive_df['video_key'] = positive_df.apply(build_key, axis=1)
+            positive_df["video_key"] = positive_df.apply(build_key, axis=1)
         else:
             positive_df = positive_df.copy()
-            positive_df['video_key'] = positive_df['video_id'].astype(str)
+            positive_df["video_key"] = positive_df["video_id"].astype(str)
 
         for _, row in positive_df.iterrows():
-            video_key = row['video_key']
+            video_key = row["video_key"]
             frame_id = int(row[frame_col])
-            if video_key not in labels:
-                labels[video_key] = set()
-            labels[video_key].add(frame_id)
+            labels.setdefault(video_key, set()).add(frame_id)
+
+    return labels
+
+
+def _load_labels_from_labelled_header(labels_dir: Path):
+    labels = {}
+    if not labels_dir.exists():
+        return labels
+
+    for match_dir in labels_dir.iterdir():
+        if not match_dir.is_dir():
+            continue
+        for file_path in match_dir.iterdir():
+            if file_path.suffix.lower() not in {".xlsx", ".csv"}:
+                continue
+            try:
+                if file_path.suffix.lower() == ".csv":
+                    df = pd.read_csv(file_path)
+                else:
+                    df = pd.read_excel(file_path)
+            except Exception as exc:
+                print(f"Warning: failed to read {file_path}: {exc}")
+                continue
+
+            if df.shape[1] < 2:
+                print(f"Warning: skipping {file_path} (expected at least 2 columns)")
+                continue
+
+            frame_series = pd.to_numeric(df.iloc[:, 1], errors="coerce")
+            frames = frame_series.dropna().astype(int).tolist()
+            if not frames:
+                continue
+
+            match_name = canonical_match_name(file_path.parent.name)
+            half = infer_half_from_stem(file_path.stem)
+            key = make_video_key(match_name, half)
+
+            for frame in frames:
+                labels.setdefault(key, set()).add(int(frame))
+
+    return labels
+
+
+def load_ground_truth_labels_from_csv(label_paths):
+    """Load ground truth labels from cache CSVs or labelled_header directory."""
+    if not label_paths:
+        return {}
+
+    labels = {}
+    csv_paths = []
+
+    for path in label_paths:
+        path_obj = Path(path)
+        if path_obj.is_dir():
+            labels.update(_load_labels_from_labelled_header(path_obj))
+        else:
+            csv_paths.append(path_obj)
+
+    if csv_paths:
+        labels.update(_load_labels_from_cache_csv(csv_paths))
 
     return labels
 
