@@ -74,7 +74,7 @@ class TestInferenceConfig:
 
     # RF-DETR config
     rf_detr_weights: Optional[Path] = None
-    rf_detr_variant: str = "medium"
+    rf_detr_variant: str = "large"
     rf_detr_label_mode: str = "soccernet"
     ball_conf_threshold: float = 0.3
 
@@ -581,11 +581,14 @@ def main():
         target_class_ids = None
 
     rf_detr_config = RFDetrConfig(
-        variant="medium",
+        variant="large",
         weights_path=str(config.rf_detr_weights) if config.rf_detr_weights else None,
         device=config.device,
         target_class_names=target_class_names,
         target_class_ids=target_class_ids,
+        optimize=True,
+        optimize_batch_size=8,
+        optimize_compile=False,
     )
     rf_detr_model = build_rf_detr(rf_detr_config)
     rf_detr = RFDetrInference(rf_detr_model, rf_detr_config)
