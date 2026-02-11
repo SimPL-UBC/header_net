@@ -21,24 +21,24 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 if [[ ! -f "${CONDA_SH}" ]]; then
-  echo "[ERROR] Conda init not found at ${CONDA_SH}; aborting." >&2
-  exit 1
+	echo "[ERROR] Conda init not found at ${CONDA_SH}; aborting." >&2
+	exit 1
 fi
 
 # shellcheck source=/dev/null
 source "${CONDA_SH}"
 if ! conda activate deep_impact_env; then
-  echo "[ERROR] Failed to activate conda env deep_impact_env; aborting." >&2
-  exit 1
+	echo "[ERROR] Failed to activate conda env deep_impact_env; aborting." >&2
+	exit 1
 fi
 
 PYTHON_BIN="$(command -v python)"
 if [[ -z "${PYTHON_BIN}" ]]; then
-  echo "[ERROR] Python executable not found after conda activate; aborting." >&2
-  exit 1
+	echo "[ERROR] Python executable not found after conda activate; aborting." >&2
+	exit 1
 fi
 
-if ! "${PYTHON_BIN}" - <<'PY'
+if ! "${PYTHON_BIN}" - <<'PY'; then
 import sys
 import torch
 
@@ -48,8 +48,7 @@ if not torch.cuda.is_available():
 print(f"[INFO] Using torch {torch.__version__} CUDA {torch.version.cuda}")
 print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
 PY
-then
-  exit 1
+	exit 1
 fi
 
 # Configurable options.
@@ -71,59 +70,69 @@ mkdir -p "${OUTPUT_BASE}"
 
 # Resolve label mode flag.
 if [[ "${LABEL_MODE}" == "continuous" ]]; then
-  LABEL_FLAG="--continuous-frame-header"
+	LABEL_FLAG="--continuous-frame-header"
 elif [[ "${LABEL_MODE}" == "one_frame" ]]; then
-  LABEL_FLAG="--one-frame-header"
+	LABEL_FLAG="--one-frame-header"
 else
-  echo "[ERROR] LABEL_MODE must be 'one_frame' or 'continuous', got '${LABEL_MODE}'" >&2
-  exit 1
+	echo "[ERROR] LABEL_MODE must be 'one_frame' or 'continuous', got '${LABEL_MODE}'" >&2
+	exit 1
 fi
 
 COMMON_ARGS=(
-  --weights "${WEIGHTS_PATH}"
-  --confidence-threshold "${CONF_THRESHOLD}"
-  --batch-size "${BATCH_SIZE}"
-  --topk "${TOPK}"
-  "${LABEL_FLAG}"
+	--weights "${WEIGHTS_PATH}"
+	--confidence-threshold "${CONF_THRESHOLD}"
+	--batch-size "${BATCH_SIZE}"
+	--topk "${TOPK}"
+	"${LABEL_FLAG}"
 )
 
 if [[ -n "${DEVICE}" ]]; then
-  COMMON_ARGS+=(--device "${DEVICE}")
+	COMMON_ARGS+=(--device "${DEVICE}")
 fi
 
 if [[ "${OPTIMIZE}" == "1" ]]; then
-  COMMON_ARGS+=(--optimize --optimize-batch-size "${OPTIMIZE_BATCH_SIZE}")
-  if [[ "${OPTIMIZE_COMPILE}" == "1" ]]; then
-    COMMON_ARGS+=(--optimize-compile)
-  fi
+	COMMON_ARGS+=(--optimize --optimize-batch-size "${OPTIMIZE_BATCH_SIZE}")
+	if [[ "${OPTIMIZE_COMPILE}" == "1" ]]; then
+		COMMON_ARGS+=(--optimize-compile)
+	fi
 fi
 
 if [[ -n "${MATCH_FILTER}" ]]; then
-  # shellcheck disable=SC2206
-  COMMON_ARGS+=(--match-filter ${MATCH_FILTER})
+	# shellcheck disable=SC2206
+	COMMON_ARGS+=(--match-filter ${MATCH_FILTER})
 fi
 
 echo "============================================================"
-echo "Dense dataset generation — ${LABEL_MODE} mode"
+echo "Dense dataset generation — ${LABEL_MODE} mode (2 GPUs)"
 echo "============================================================"
 
-# ── Train split ──
+# ── Train on GPU 0, Val on GPU 1 — in parallel ──
 echo ""
-echo "[STEP 1/2] Generating train split..."
-"${PYTHON_BIN}" "${REPO_ROOT}/dataset_generation/generate_dense_dataset.py" \
-  --dataset-path "${REPO_ROOT}/SoccerNet/train" \
-  --labels-dir "${REPO_ROOT}/SoccerNet/train/labelled_header" \
-  --output-path "${OUTPUT_BASE}/dense_train.parquet" \
-  "${COMMON_ARGS[@]}"
+echo "[PARALLEL] Train → GPU 0 | Val → GPU 1"
 
-# ── Val split ──
-echo ""
-echo "[STEP 2/2] Generating val split..."
-"${PYTHON_BIN}" "${REPO_ROOT}/dataset_generation/generate_dense_dataset.py" \
-  --dataset-path "${REPO_ROOT}/SoccerNet/val" \
-  --labels-dir "${REPO_ROOT}/SoccerNet/val/labelled_header" \
-  --output-path "${OUTPUT_BASE}/dense_val.parquet" \
-  "${COMMON_ARGS[@]}"
+CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" \
+	"${REPO_ROOT}/dataset_generation/generate_dense_dataset.py" \
+	--dataset-path "${REPO_ROOT}/SoccerNet/train" \
+	--labels-dir "${REPO_ROOT}/SoccerNet/train/labelled_header" \
+	--output-path "${OUTPUT_BASE}/dense_train.parquet" \
+	"${COMMON_ARGS[@]}" &
+PID_TRAIN=$!
+
+CUDA_VISIBLE_DEVICES=1 "${PYTHON_BIN}" \
+	"${REPO_ROOT}/dataset_generation/generate_dense_dataset.py" \
+	--dataset-path "${REPO_ROOT}/SoccerNet/val" \
+	--labels-dir "${REPO_ROOT}/SoccerNet/val/labelled_header" \
+	--output-path "${OUTPUT_BASE}/dense_val.parquet" \
+	"${COMMON_ARGS[@]}" &
+PID_VAL=$!
+
+FAIL=0
+wait "${PID_TRAIN}" || FAIL=1
+wait "${PID_VAL}" || FAIL=1
+if [[ "${FAIL}" -ne 0 ]]; then
+	echo "[ERROR] One or both splits failed." >&2
+	exit 1
+fi
 
 echo ""
 echo "============================================================"
