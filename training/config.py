@@ -8,6 +8,10 @@ class Config:
     # Data
     train_csv: str = ""
     val_csv: str = ""
+    train_parquet: str = ""
+    val_parquet: str = ""
+    dataset_root: str = ""
+    neg_pos_ratio: str = "all"
     num_frames: int = 16  # Default to current cache value
     input_size: int = 224
     frame_sampling: str = "center"  # Phase 1: only "center" supported
@@ -40,6 +44,8 @@ class Config:
     output_root: str = "report/header_experiments"
     gpus: Optional[List[int]] = None
     layer_lr_decay: float = 0.75
+    f1_threshold_step: float = 0.01
+    save_epoch_indices: bool = True
 
 
 def merge_cli_args(args: argparse.Namespace) -> Config:
@@ -53,6 +59,14 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.train_csv = args.train_csv
     if hasattr(args, "val_csv"):
         config.val_csv = args.val_csv
+    if hasattr(args, "train_parquet"):
+        config.train_parquet = args.train_parquet
+    if hasattr(args, "val_parquet"):
+        config.val_parquet = args.val_parquet
+    if hasattr(args, "dataset_root"):
+        config.dataset_root = args.dataset_root
+    if hasattr(args, "neg_pos_ratio"):
+        config.neg_pos_ratio = str(args.neg_pos_ratio)
 
     # Model
     if hasattr(args, "backbone"):
@@ -103,5 +117,9 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.focal_gamma = args.focal_gamma
     if hasattr(args, "focal_alpha"):
         config.focal_alpha = args.focal_alpha
+    if hasattr(args, "f1_threshold_step"):
+        config.f1_threshold_step = args.f1_threshold_step
+    if hasattr(args, "save_epoch_indices"):
+        config.save_epoch_indices = args.save_epoch_indices
 
     return config
