@@ -140,6 +140,14 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Full path for output .parquet file",
     )
+    parser.add_argument(
+        "--failed-log-path",
+        type=str,
+        help=(
+            "Optional path for failed videos CSV. "
+            "Defaults to <output_path_parent>/<output_path_stem>_failed_videos.csv"
+        ),
+    )
 
     # Mutually exclusive labeling mode
     label_group = parser.add_mutually_exclusive_group(required=True)
@@ -172,6 +180,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=15,
         help="Maximum detections to keep per frame",
+    )
+    parser.add_argument(
+        "--min-decode-ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "Minimum decoded/expected frame ratio required to keep a video. "
+            "Videos below this threshold are dropped."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -470,10 +487,17 @@ def main() -> None:
 
     if args.batch_size < 1:
         raise ValueError("batch-size must be >= 1")
+    if not 0.0 <= args.min_decode_ratio <= 1.0:
+        raise ValueError("--min-decode-ratio must be in [0.0, 1.0]")
 
     output_path = Path(args.output_path)
     if not str(output_path).lower().endswith(".parquet"):
         raise ValueError("--output-path must end with .parquet")
+    failed_log_path = (
+        Path(args.failed_log_path)
+        if args.failed_log_path
+        else output_path.parent / f"{output_path.stem}_failed_videos.csv"
+    )
 
     dataset_path = Path(args.dataset_path)
     labels_dir = Path(args.labels_dir)
@@ -562,6 +586,9 @@ def main() -> None:
                     "half": source.half,
                     "key": key,
                     "path": str(source.path),
+                    "requested_frames": max(int(source.frame_count), 0),
+                    "read_frames": 0,
+                    "read_ratio": 0.0,
                     "reason": f"exception: {exc}",
                     "elapsed_seconds": round(elapsed, 2),
                 }
@@ -569,18 +596,28 @@ def main() -> None:
             print(f"\n[WARN] Failed to process {key}: {exc}")
             continue
 
-        if decoded == 0:
+        requested_frames = int(total_frames) if int(total_frames) > 0 else int(decoded)
+        read_ratio = (decoded / requested_frames) if requested_frames else 0.0
+        if requested_frames == 0 or read_ratio < args.min_decode_ratio:
+            elapsed = time.perf_counter() - t_video
             failed_records.append(
                 {
                     "video_id": source.match_name,
                     "half": source.half,
                     "key": key,
                     "path": str(source.path),
-                    "reason": "no_frames_decoded",
-                    "elapsed_seconds": round(time.perf_counter() - t_video, 2),
+                    "requested_frames": requested_frames,
+                    "read_frames": decoded,
+                    "read_ratio": round(read_ratio, 4),
+                    "min_decode_ratio": args.min_decode_ratio,
+                    "reason": "decode_rate_below_threshold",
+                    "elapsed_seconds": round(elapsed, 2),
                 }
             )
-            print(f"\n[WARN] No frames decoded for {key}")
+            print(
+                f"\n[WARN] Skipping {key}: decoded {decoded}/{requested_frames} "
+                f"frames ({read_ratio:.2%}), threshold={args.min_decode_ratio:.2%}"
+            )
             continue
 
         # Kalman smooth ball trajectory
@@ -607,7 +644,7 @@ def main() -> None:
         ball_rate = len(smoothed_ball) / decoded * 100 if decoded else 0
         pos_count = sum(1 for r in records if r["label"] == 1)
         print(
-            f"\n[INFO] {key}: {decoded}/{total_frames} frames decoded, "
+            f"\n[INFO] {key}: {decoded}/{requested_frames} frames decoded ({read_ratio:.2%}), "
             f"ball={ball_rate:.1f}%, positives={pos_count}, "
             f"time={elapsed:.1f}s"
         )
@@ -657,9 +694,11 @@ def main() -> None:
     # ── Step 8: Save failures ──
     if failed_records:
         failed_df = pd.DataFrame(failed_records)
-        failed_path = output_path.parent / "failed_videos.csv"
-        failed_df.to_csv(failed_path, index=False)
-        print(f"[WARN] Logged {len(failed_df)} failed video(s) to {failed_path}")
+        failed_log_path.parent.mkdir(parents=True, exist_ok=True)
+        failed_df.to_csv(failed_log_path, index=False)
+        print(f"[WARN] Logged {len(failed_df)} failed video(s) to {failed_log_path}")
+    elif failed_log_path.exists():
+        failed_log_path.unlink()
 
     # ── Step 9: Summary ──
     ball_rate = total_ball_detected / total_frames_processed * 100 if total_frames_processed else 0

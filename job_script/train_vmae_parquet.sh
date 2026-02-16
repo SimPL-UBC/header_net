@@ -20,6 +20,8 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # F1_THRESHOLD_STEP
 # SEED, GPUS
 # SAVE_EPOCH_INDICES: true|false
+# VALIDATE_VIDEO_LOAD: 1 to verify parquet video paths can be opened/decoded before training (default: 1)
+# VALIDATE_VIDEO_LOAD_MAX_ERRORS: max unreadable paths to print (default: 20)
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 if [[ ! -f "${CONDA_SH}" ]]; then
@@ -65,6 +67,63 @@ F1_THRESHOLD_STEP="${F1_THRESHOLD_STEP:-0.01}"
 SEED="${SEED:-42}"
 GPUS="${GPUS:-0 1}"
 SAVE_EPOCH_INDICES="${SAVE_EPOCH_INDICES:-true}"
+VALIDATE_VIDEO_LOAD="${VALIDATE_VIDEO_LOAD:-1}"
+VALIDATE_VIDEO_LOAD_MAX_ERRORS="${VALIDATE_VIDEO_LOAD_MAX_ERRORS:-20}"
+
+if [[ "${VALIDATE_VIDEO_LOAD}" == "1" ]]; then
+  echo "[INFO] Validating video readability from train/val parquet files..."
+  "${PYTHON_BIN}" - "${TRAIN_PARQUET}" "${VAL_PARQUET}" "${VALIDATE_VIDEO_LOAD_MAX_ERRORS}" <<'PY'
+import sys
+from pathlib import Path
+
+import cv2
+import pandas as pd
+
+train_parquet = Path(sys.argv[1])
+val_parquet = Path(sys.argv[2])
+max_errors = int(sys.argv[3])
+
+bad = []
+for split_name, parquet_path in (("train", train_parquet), ("val", val_parquet)):
+    if not parquet_path.exists():
+        bad.append((split_name, str(parquet_path), "parquet_missing"))
+        continue
+
+    df = pd.read_parquet(parquet_path, columns=["video_path"])
+    for video_path in pd.unique(df["video_path"].astype(str)):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            bad.append((split_name, video_path, "open_failed"))
+            continue
+
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        ok, _ = cap.read()
+        cap.release()
+
+        if frame_count <= 0:
+            bad.append((split_name, video_path, f"invalid_frame_count={frame_count}"))
+        elif not ok:
+            bad.append((split_name, video_path, "first_frame_decode_failed"))
+
+if bad:
+    print(
+        f"[ERROR] Found {len(bad)} unreadable video path(s) referenced by parquet files.",
+        file=sys.stderr,
+    )
+    for split_name, path, reason in bad[:max_errors]:
+        print(f"  - {split_name}: {path} ({reason})", file=sys.stderr)
+    if len(bad) > max_errors:
+        print(f"  ... and {len(bad) - max_errors} more", file=sys.stderr)
+    print(
+        "[ERROR] Regenerate parquet with corrupted videos removed, "
+        "or set VALIDATE_VIDEO_LOAD=0 to bypass this check.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print("[INFO] Video readability check passed.")
+PY
+fi
 
 ARGS=(
   -m training.cli_train_header_parquet

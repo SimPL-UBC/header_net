@@ -18,6 +18,8 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # OPTIMIZE_COMPILE: 1 to enable torch compile (default: 0)
 # OUTPUT_BASE: base output directory (default: ${REPO_ROOT}/output/dense_dataset)
 # MATCH_FILTER: space-separated match names to process (default: all)
+# MIN_DECODE_RATIO: minimum decoded/expected frame ratio to keep a video (default: 0.5)
+# REMOVE_HEAVILY_CORRUPTED: set 1 to delete videos flagged with decode_rate_below_threshold (default: 0)
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 if [[ ! -f "${CONDA_SH}" ]]; then
@@ -58,6 +60,8 @@ CONF_THRESHOLD="${CONF_THRESHOLD:-0.25}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 TOPK="${TOPK:-15}"
 OUTPUT_BASE="${OUTPUT_BASE:-${REPO_ROOT}/output/dense_dataset}"
+MIN_DECODE_RATIO="${MIN_DECODE_RATIO:-0.5}"
+REMOVE_HEAVILY_CORRUPTED="${REMOVE_HEAVILY_CORRUPTED:-0}"
 
 # Optional toggles.
 DEVICE="${DEVICE:-}"
@@ -67,6 +71,17 @@ OPTIMIZE_COMPILE="${OPTIMIZE_COMPILE:-0}"
 MATCH_FILTER="${MATCH_FILTER:-}"
 
 mkdir -p "${OUTPUT_BASE}"
+
+if ! "${PYTHON_BIN}" - "${MIN_DECODE_RATIO}" <<'PY'; then
+import sys
+
+value = float(sys.argv[1])
+if not 0.0 <= value <= 1.0:
+    raise ValueError("MIN_DECODE_RATIO must be in [0.0, 1.0]")
+PY
+	echo "[ERROR] Invalid MIN_DECODE_RATIO: ${MIN_DECODE_RATIO}" >&2
+	exit 1
+fi
 
 # Resolve label mode flag.
 if [[ "${LABEL_MODE}" == "continuous" ]]; then
@@ -102,28 +117,115 @@ if [[ -n "${MATCH_FILTER}" ]]; then
 	COMMON_ARGS+=(--match-filter ${MATCH_FILTER})
 fi
 
+TRAIN_OUTPUT="${OUTPUT_BASE}/dense_train.parquet"
+VAL_OUTPUT="${OUTPUT_BASE}/dense_val.parquet"
+TRAIN_FAILED_LOG="${OUTPUT_BASE}/dense_train_failed_videos.csv"
+VAL_FAILED_LOG="${OUTPUT_BASE}/dense_val_failed_videos.csv"
+
+cleanup_heavily_corrupted_videos() {
+	local failed_csv="$1"
+	local split_name="$2"
+
+	if [[ "${REMOVE_HEAVILY_CORRUPTED}" != "1" ]]; then
+		return 0
+	fi
+
+	if [[ ! -f "${failed_csv}" ]]; then
+		echo "[INFO] ${split_name}: no failed video log at ${failed_csv}; skipping cleanup."
+		return 0
+	fi
+
+	if ! "${PYTHON_BIN}" - "${failed_csv}" "${split_name}" <<'PY'; then
+import csv
+import sys
+from pathlib import Path
+
+failed_csv = Path(sys.argv[1])
+split_name = sys.argv[2]
+reasons_to_remove = {"decode_rate_below_threshold"}
+
+paths = []
+with failed_csv.open("r", encoding="utf-8", newline="") as fh:
+    reader = csv.DictReader(fh)
+    for row in reader:
+        reason = (row.get("reason") or "").strip()
+        if reason not in reasons_to_remove:
+            continue
+        path_text = (row.get("path") or "").strip()
+        if path_text:
+            paths.append(path_text)
+
+unique_paths = []
+seen = set()
+for value in paths:
+    if value in seen:
+        continue
+    seen.add(value)
+    unique_paths.append(Path(value))
+
+removed = 0
+missing = 0
+delete_errors = 0
+for path in unique_paths:
+    try:
+        if path.exists():
+            path.unlink()
+            removed += 1
+        else:
+            missing += 1
+    except Exception as exc:
+        delete_errors += 1
+        print(f"[WARN] {split_name}: unable to delete {path}: {exc}")
+
+print(
+    f"[INFO] {split_name}: corrupted cleanup candidates={len(unique_paths)} "
+    f"removed={removed} missing={missing} delete_errors={delete_errors}"
+)
+PY
+		echo "[WARN] ${split_name}: cleanup step failed for ${failed_csv}" >&2
+	fi
+}
+
+run_split() {
+	local split_name="$1"
+	local gpu_id="$2"
+	local dataset_path="$3"
+	local labels_dir="$4"
+	local output_path="$5"
+	local failed_log_path="$6"
+
+	local status=0
+	if CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" \
+		"${REPO_ROOT}/dataset_generation/generate_dense_dataset.py" \
+		--dataset-path "${dataset_path}" \
+		--labels-dir "${labels_dir}" \
+		--output-path "${output_path}" \
+		--failed-log-path "${failed_log_path}" \
+		--min-decode-ratio "${MIN_DECODE_RATIO}" \
+		"${COMMON_ARGS[@]}"; then
+		:
+	else
+		status=$?
+	fi
+
+	cleanup_heavily_corrupted_videos "${failed_log_path}" "${split_name}"
+	return "${status}"
+}
+
 echo "============================================================"
 echo "Dense dataset generation — ${LABEL_MODE} mode (2 GPUs)"
 echo "============================================================"
+echo "Min decode ratio: ${MIN_DECODE_RATIO}"
+echo "Delete heavily corrupted videos: ${REMOVE_HEAVILY_CORRUPTED}"
 
 # ── Train on GPU 0, Val on GPU 1 — in parallel ──
 echo ""
 echo "[PARALLEL] Train → GPU 0 | Val → GPU 1"
 
-CUDA_VISIBLE_DEVICES=0 "${PYTHON_BIN}" \
-	"${REPO_ROOT}/dataset_generation/generate_dense_dataset.py" \
-	--dataset-path "${REPO_ROOT}/SoccerNet/train" \
-	--labels-dir "${REPO_ROOT}/SoccerNet/train/labelled_header" \
-	--output-path "${OUTPUT_BASE}/dense_train.parquet" \
-	"${COMMON_ARGS[@]}" &
+run_split "train" "0" "${REPO_ROOT}/SoccerNet/train" "${REPO_ROOT}/SoccerNet/train/labelled_header" "${TRAIN_OUTPUT}" "${TRAIN_FAILED_LOG}" &
 PID_TRAIN=$!
 
-CUDA_VISIBLE_DEVICES=1 "${PYTHON_BIN}" \
-	"${REPO_ROOT}/dataset_generation/generate_dense_dataset.py" \
-	--dataset-path "${REPO_ROOT}/SoccerNet/val" \
-	--labels-dir "${REPO_ROOT}/SoccerNet/val/labelled_header" \
-	--output-path "${OUTPUT_BASE}/dense_val.parquet" \
-	"${COMMON_ARGS[@]}" &
+run_split "val" "1" "${REPO_ROOT}/SoccerNet/val" "${REPO_ROOT}/SoccerNet/val/labelled_header" "${VAL_OUTPUT}" "${VAL_FAILED_LOG}" &
 PID_VAL=$!
 
 FAIL=0
@@ -137,6 +239,9 @@ fi
 echo ""
 echo "============================================================"
 echo "Done. Outputs:"
-echo "  Train: ${OUTPUT_BASE}/dense_train.parquet"
-echo "  Val:   ${OUTPUT_BASE}/dense_val.parquet"
+echo "  Train: ${TRAIN_OUTPUT}"
+echo "  Val:   ${VAL_OUTPUT}"
+echo "Failed logs:"
+echo "  Train: ${TRAIN_FAILED_LOG}"
+echo "  Val:   ${VAL_FAILED_LOG}"
 echo "============================================================"
