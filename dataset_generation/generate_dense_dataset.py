@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -191,6 +193,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--drop-on-decode-error",
+        action="store_true",
+        help=(
+            "Skip a video if ffmpeg reports any decode errors while scanning it."
+        ),
+    )
+    parser.add_argument(
+        "--ffmpeg-bin",
+        type=str,
+        default="ffmpeg",
+        help="ffmpeg executable to use when --drop-on-decode-error is enabled",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         help="Torch device override (cpu/cuda/mps)",
@@ -273,6 +288,44 @@ def build_label_lookup(
                     lookup[key].add(f)
 
     return lookup
+
+
+def detect_decode_error_with_ffmpeg(
+    video_path: Path,
+    ffmpeg_bin: str,
+) -> Tuple[bool, str]:
+    """Return ``(has_error, preview)`` based on ffmpeg decode scan output."""
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-nostdin",
+        "-v",
+        "error",
+        "-i",
+        str(video_path),
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except Exception as exc:  # pragma: no cover - defensive path
+        return True, f"ffmpeg_scan_exception: {exc}"
+
+    stderr_text = (result.stderr or "").strip()
+    if not stderr_text:
+        return False, ""
+
+    first_line = stderr_text.splitlines()[0].strip()
+    if len(first_line) > 300:
+        first_line = first_line[:297] + "..."
+    return True, first_line
 
 
 def smooth_ball_detections(
@@ -489,6 +542,10 @@ def main() -> None:
         raise ValueError("batch-size must be >= 1")
     if not 0.0 <= args.min_decode_ratio <= 1.0:
         raise ValueError("--min-decode-ratio must be in [0.0, 1.0]")
+    if args.drop_on_decode_error and shutil.which(args.ffmpeg_bin) is None:
+        raise ValueError(
+            f"--ffmpeg-bin executable not found: {args.ffmpeg_bin}"
+        )
 
     output_path = Path(args.output_path)
     if not str(output_path).lower().endswith(".parquet"):
@@ -570,6 +627,32 @@ def main() -> None:
         header_frames = label_lookup.get(key, set())
 
         t_video = time.perf_counter()
+        if args.drop_on_decode_error:
+            has_decode_error, error_preview = detect_decode_error_with_ffmpeg(
+                source.path,
+                args.ffmpeg_bin,
+            )
+            if has_decode_error:
+                elapsed = time.perf_counter() - t_video
+                failed_records.append(
+                    {
+                        "video_id": source.match_name,
+                        "half": source.half,
+                        "key": key,
+                        "path": str(source.path),
+                        "requested_frames": max(int(source.frame_count), 0),
+                        "read_frames": 0,
+                        "read_ratio": 0.0,
+                        "reason": "ffmpeg_decode_error",
+                        "ffmpeg_error": error_preview,
+                        "elapsed_seconds": round(elapsed, 2),
+                    }
+                )
+                print(
+                    f"\n[WARN] Skipping {key}: ffmpeg decode error detected "
+                    f"({error_preview})"
+                )
+                continue
         try:
             raw_dets, total_frames, decoded = run_dense_detection(
                 source,

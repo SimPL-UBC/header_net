@@ -20,6 +20,8 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # MATCH_FILTER: space-separated match names to process (default: all)
 # MIN_DECODE_RATIO: minimum decoded/expected frame ratio to keep a video (default: 0.5)
 # REMOVE_HEAVILY_CORRUPTED: set 1 to delete videos flagged with decode_rate_below_threshold (default: 0)
+# STRICT_DECODE_ERRORS: set 1 to skip videos with any ffmpeg decode error (default: 1)
+# FFMPEG_BIN: ffmpeg executable for strict decode scans (default: ffmpeg)
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 if [[ ! -f "${CONDA_SH}" ]]; then
@@ -62,6 +64,8 @@ TOPK="${TOPK:-15}"
 OUTPUT_BASE="${OUTPUT_BASE:-${REPO_ROOT}/output/dense_dataset}"
 MIN_DECODE_RATIO="${MIN_DECODE_RATIO:-0.5}"
 REMOVE_HEAVILY_CORRUPTED="${REMOVE_HEAVILY_CORRUPTED:-0}"
+STRICT_DECODE_ERRORS="${STRICT_DECODE_ERRORS:-1}"
+FFMPEG_BIN="${FFMPEG_BIN:-ffmpeg}"
 
 # Optional toggles.
 DEVICE="${DEVICE:-}"
@@ -117,6 +121,10 @@ if [[ -n "${MATCH_FILTER}" ]]; then
 	COMMON_ARGS+=(--match-filter ${MATCH_FILTER})
 fi
 
+if [[ "${STRICT_DECODE_ERRORS}" == "1" ]]; then
+	COMMON_ARGS+=(--drop-on-decode-error --ffmpeg-bin "${FFMPEG_BIN}")
+fi
+
 TRAIN_OUTPUT="${OUTPUT_BASE}/dense_train.parquet"
 VAL_OUTPUT="${OUTPUT_BASE}/dense_val.parquet"
 TRAIN_FAILED_LOG="${OUTPUT_BASE}/dense_train_failed_videos.csv"
@@ -142,7 +150,7 @@ from pathlib import Path
 
 failed_csv = Path(sys.argv[1])
 split_name = sys.argv[2]
-reasons_to_remove = {"decode_rate_below_threshold"}
+reasons_to_remove = {"decode_rate_below_threshold", "ffmpeg_decode_error"}
 
 paths = []
 with failed_csv.open("r", encoding="utf-8", newline="") as fh:
@@ -216,6 +224,7 @@ echo "============================================================"
 echo "Dense dataset generation — ${LABEL_MODE} mode (2 GPUs)"
 echo "============================================================"
 echo "Min decode ratio: ${MIN_DECODE_RATIO}"
+echo "Strict decode errors: ${STRICT_DECODE_ERRORS} (ffmpeg=${FFMPEG_BIN})"
 echo "Delete heavily corrupted videos: ${REMOVE_HEAVILY_CORRUPTED}"
 
 # ── Train on GPU 0, Val on GPU 1 — in parallel ──
