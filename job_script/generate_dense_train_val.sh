@@ -9,7 +9,9 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # Env overrides:
 # LABEL_MODE: "one_frame" or "continuous" (default: continuous)
 # CONTINUOUS_OFFSETS_25FPS: space-separated offsets for continuous labels at 25fps
-#   default: "-1 0 1 2 3" (50fps uses stride=2 => "-2 0 2 4 6")
+#   default: "-1 0 1 2 3"
+# CONTINUOUS_OFFSETS_50FPS: space-separated offsets for continuous labels at 50fps/high-fps videos
+#   default: "-2 -1 0 1 2 3 4 5 6"
 # MODEL_NUM_FRAMES: model clip length used for window-valid row filtering (default: 16)
 #   For NUM_FRAMES=16, model input offsets at 25fps are: -8 -7 -6 -5 -4 -3 -2 -1 0 1 2 3 4 5 6 7
 # WEIGHTS_PATH: path to SoccerNet RF-DETR weights
@@ -62,6 +64,7 @@ fi
 # Configurable options.
 LABEL_MODE="${LABEL_MODE:-continuous}"
 CONTINUOUS_OFFSETS_25FPS="${CONTINUOUS_OFFSETS_25FPS:--1 0 1 2 3}"
+CONTINUOUS_OFFSETS_50FPS="${CONTINUOUS_OFFSETS_50FPS:--2 -1 0 1 2 3 4 5 6}"
 MODEL_NUM_FRAMES="${MODEL_NUM_FRAMES:-16}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${REPO_ROOT}/RFDETR-Soccernet/weights/checkpoint_best_regular.pth}"
 CONF_THRESHOLD="${CONF_THRESHOLD:-0.25}"
@@ -119,7 +122,14 @@ if [[ "${LABEL_MODE}" == "continuous" ]]; then
 		echo "[ERROR] CONTINUOUS_OFFSETS_25FPS cannot be empty in continuous mode." >&2
 		exit 1
 	fi
+	# shellcheck disable=SC2206
+	CONTINUOUS_OFFSETS_50_ARR=(${CONTINUOUS_OFFSETS_50FPS})
+	if [[ "${#CONTINUOUS_OFFSETS_50_ARR[@]}" -eq 0 ]]; then
+		echo "[ERROR] CONTINUOUS_OFFSETS_50FPS cannot be empty in continuous mode." >&2
+		exit 1
+	fi
 	COMMON_ARGS+=(--continuous-offsets-25fps "${CONTINUOUS_OFFSETS_ARR[@]}")
+	COMMON_ARGS+=(--continuous-offsets-50fps "${CONTINUOUS_OFFSETS_50_ARR[@]}")
 fi
 
 if [[ -n "${DEVICE}" ]]; then
@@ -247,6 +257,7 @@ echo "============================================================"
 echo "Model num frames: ${MODEL_NUM_FRAMES}"
 if [[ "${LABEL_MODE}" == "continuous" ]]; then
 	echo "Continuous offsets @25fps: ${CONTINUOUS_OFFSETS_25FPS}"
+	echo "Continuous offsets @50fps: ${CONTINUOUS_OFFSETS_50FPS}"
 fi
 echo "Min decode ratio: ${MIN_DECODE_RATIO}"
 echo "Strict decode errors: ${STRICT_DECODE_ERRORS} (ffmpeg=${FFMPEG_BIN})"

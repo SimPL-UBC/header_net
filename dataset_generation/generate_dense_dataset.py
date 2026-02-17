@@ -186,9 +186,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=[-1, 0, 1, 2, 3],
         help=(
-            "Relative offsets used for continuous labels at 25fps. "
-            "For 50fps, offsets are multiplied by stride=2."
+            "Relative offsets used for continuous labels at 25fps/normal-fps videos."
         ),
+    )
+    parser.add_argument(
+        "--continuous-offsets-50fps",
+        nargs="+",
+        type=int,
+        default=[-2, -1, 0, 1, 2, 3, 4, 5, 6],
+        help="Relative offsets used for continuous labels at 50fps/high-fps videos.",
     )
 
     # Detection parameters
@@ -291,6 +297,7 @@ def build_label_lookup(
     stride_map: Dict[str, int],
     continuous: bool,
     continuous_offsets_25fps: Sequence[int],
+    continuous_offsets_50fps: Sequence[int],
 ) -> Dict[str, Set[int]]:
     """Build ``{video_key: set_of_positive_frames}`` from annotation data.
 
@@ -302,9 +309,12 @@ def build_label_lookup(
         Pre-computed ``{video_key: stride}`` (avoids re-opening videos).
     """
     lookup: Dict[str, Set[int]] = {}
-    base_offsets = [int(x) for x in continuous_offsets_25fps]
-    if not base_offsets:
+    offsets_25fps = [int(x) for x in continuous_offsets_25fps]
+    offsets_50fps = [int(x) for x in continuous_offsets_50fps]
+    if not offsets_25fps:
         raise ValueError("continuous_offsets_25fps must contain at least one offset")
+    if not offsets_50fps:
+        raise ValueError("continuous_offsets_50fps must contain at least one offset")
 
     for _, row in labels_df.iterrows():
         video_id = str(row["video_id"])
@@ -319,8 +329,8 @@ def build_label_lookup(
             lookup[key].add(frame)
         else:
             stride = stride_map.get(key, 1)
-            scaled_offsets = [int(offset * stride) for offset in base_offsets]
-            for offset in scaled_offsets:
+            selected_offsets = offsets_50fps if stride >= 2 else offsets_25fps
+            for offset in selected_offsets:
                 f = frame + offset
                 if f >= 0:
                     lookup[key].add(f)
@@ -678,6 +688,7 @@ def main() -> None:
         stride_map,
         continuous=(label_mode == "continuous"),
         continuous_offsets_25fps=args.continuous_offsets_25fps,
+        continuous_offsets_50fps=args.continuous_offsets_50fps,
     )
     total_positive_frames = sum(len(v) for v in label_lookup.values())
     print(
@@ -894,6 +905,7 @@ def main() -> None:
             b"generator": b"generate_dense_dataset.py",
             b"label_mode": label_mode.encode(),
             b"continuous_offsets_25fps": json.dumps(args.continuous_offsets_25fps).encode(),
+            b"continuous_offsets_50fps": json.dumps(args.continuous_offsets_50fps).encode(),
             b"model_num_frames": str(args.model_num_frames).encode(),
             b"confidence_threshold": str(args.confidence_threshold).encode(),
             b"creation_date": datetime.now().isoformat().encode(),
