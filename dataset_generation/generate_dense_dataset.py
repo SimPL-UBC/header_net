@@ -9,6 +9,10 @@ clips are cached — the training dataloader reads video on-the-fly using this m
 Two labeling modes are supported (mutually exclusive):
   --one-frame-header        Only annotated frames get label=1
   --continuous-frame-header  Annotated + FPS-adaptive surrounding frames get label=1
+
+Training window note:
+  For VMAE training with ``num_frames=16``, each sample uses frame offsets
+  ``[-8, -7, ..., +7]`` around the center frame at 25fps.
 """
 
 from __future__ import annotations
@@ -150,18 +154,41 @@ def parse_args() -> argparse.Namespace:
             "Defaults to <output_path_parent>/<output_path_stem>_failed_videos.csv"
         ),
     )
+    parser.add_argument(
+        "--failed-frame-log-path",
+        type=str,
+        help=(
+            "Optional path for failed frames CSV (rows dropped by model-window filter). "
+            "Defaults to <output_path_parent>/<output_path_stem>_failed_frames.csv"
+        ),
+    )
 
-    # Mutually exclusive labeling mode
-    label_group = parser.add_mutually_exclusive_group(required=True)
+    # Mutually exclusive labeling mode (defaults to continuous).
+    label_group = parser.add_mutually_exclusive_group(required=False)
     label_group.add_argument(
         "--one-frame-header",
-        action="store_true",
+        dest="label_mode",
+        action="store_const",
+        const="one_frame",
         help="Only annotated frames get label=1",
     )
     label_group.add_argument(
         "--continuous-frame-header",
-        action="store_true",
+        dest="label_mode",
+        action="store_const",
+        const="continuous",
         help="Annotated + FPS-adaptive surrounding frames get label=1",
+    )
+    parser.set_defaults(label_mode="continuous")
+    parser.add_argument(
+        "--continuous-offsets-25fps",
+        nargs="+",
+        type=int,
+        default=[-1, 0, 1, 2, 3],
+        help=(
+            "Relative offsets used for continuous labels at 25fps. "
+            "For 50fps, offsets are multiplied by stride=2."
+        ),
     )
 
     # Detection parameters
@@ -190,6 +217,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Minimum decoded/expected frame ratio required to keep a video. "
             "Videos below this threshold are dropped."
+        ),
+    )
+    parser.add_argument(
+        "--model-num-frames",
+        type=int,
+        default=16,
+        help=(
+            "Training clip length used to drop rows whose full temporal window "
+            "is unavailable in decoded frames."
         ),
     )
     parser.add_argument(
@@ -254,11 +290,11 @@ def build_label_lookup(
     labels_df: pd.DataFrame,
     stride_map: Dict[str, int],
     continuous: bool,
+    continuous_offsets_25fps: Sequence[int],
 ) -> Dict[str, Set[int]]:
     """Build ``{video_key: set_of_positive_frames}`` from annotation data.
 
-    In *continuous* mode the annotated frame is expanded by FPS-adaptive offsets
-    so that the positive window covers ~0.64 s regardless of FPS.
+    In *continuous* mode the annotated frame is expanded by FPS-adaptive offsets.
 
     Parameters
     ----------
@@ -266,6 +302,9 @@ def build_label_lookup(
         Pre-computed ``{video_key: stride}`` (avoids re-opening videos).
     """
     lookup: Dict[str, Set[int]] = {}
+    base_offsets = [int(x) for x in continuous_offsets_25fps]
+    if not base_offsets:
+        raise ValueError("continuous_offsets_25fps must contain at least one offset")
 
     for _, row in labels_df.iterrows():
         video_id = str(row["video_id"])
@@ -280,9 +319,8 @@ def build_label_lookup(
             lookup[key].add(frame)
         else:
             stride = stride_map.get(key, 1)
-            # ~0.64s coverage: 16 frames at 25fps (stride=1), 32 frames at 50fps (stride=2)
-            half_window = 8 * stride
-            for offset in range(-half_window, half_window):
+            scaled_offsets = [int(offset * stride) for offset in base_offsets]
+            for offset in scaled_offsets:
                 f = frame + offset
                 if f >= 0:
                     lookup[key].add(f)
@@ -441,6 +479,39 @@ def run_dense_detection(
     return raw, total_frames, decoded
 
 
+def _build_model_window_offsets(num_frames: int) -> np.ndarray:
+    if num_frames <= 0:
+        raise ValueError("model_num_frames must be > 0")
+    half = num_frames // 2
+    if num_frames % 2 == 0:
+        return np.arange(-half, half, dtype=np.int32)
+    return np.arange(-half, half + 1, dtype=np.int32)
+
+
+def filter_records_by_model_window(
+    records: List[Dict],
+    model_num_frames: int,
+    frame_count: int,
+) -> Tuple[List[Dict], int, List[Dict]]:
+    """Keep only rows whose full model temporal window exists in decoded frames."""
+    if not records:
+        return records, 0, []
+    if frame_count <= 0:
+        return [], len(records), records.copy()
+
+    offsets = _build_model_window_offsets(model_num_frames)
+    frame_ids = np.array([int(r["frame"]) for r in records], dtype=np.int64)
+    available_frames = np.unique(frame_ids)
+    requested = frame_ids[:, None] + offsets[None, :]
+    clamped = np.clip(requested, 0, frame_count - 1)
+    valid = np.isin(clamped, available_frames).all(axis=1)
+
+    filtered = [records[i] for i, keep in enumerate(valid) if keep]
+    dropped_records = [records[i] for i, keep in enumerate(valid) if not keep]
+    dropped = int((~valid).sum())
+    return filtered, dropped, dropped_records
+
+
 def build_frame_records(
     raw_dets: Dict[int, List[Dict[str, float]]],
     smoothed_ball: Dict[int, Dict[str, float]],
@@ -542,6 +613,8 @@ def main() -> None:
         raise ValueError("batch-size must be >= 1")
     if not 0.0 <= args.min_decode_ratio <= 1.0:
         raise ValueError("--min-decode-ratio must be in [0.0, 1.0]")
+    if args.model_num_frames <= 0:
+        raise ValueError("--model-num-frames must be > 0")
     if args.drop_on_decode_error and shutil.which(args.ffmpeg_bin) is None:
         raise ValueError(
             f"--ffmpeg-bin executable not found: {args.ffmpeg_bin}"
@@ -555,11 +628,16 @@ def main() -> None:
         if args.failed_log_path
         else output_path.parent / f"{output_path.stem}_failed_videos.csv"
     )
+    failed_frame_log_path = (
+        Path(args.failed_frame_log_path)
+        if args.failed_frame_log_path
+        else output_path.parent / f"{output_path.stem}_failed_frames.csv"
+    )
 
     dataset_path = Path(args.dataset_path)
     labels_dir = Path(args.labels_dir)
     weights_path = Path(args.weights)
-    label_mode = "continuous" if args.continuous_frame_header else "one_frame"
+    label_mode = args.label_mode
 
     # ── Step 1: Load header labels ──
     labels_df, resolved_root = load_labels_dataframe(labels_dir)
@@ -596,7 +674,10 @@ def main() -> None:
 
     # ── Step 4: Build header frame lookup ──
     label_lookup = build_label_lookup(
-        labels_df, stride_map, continuous=args.continuous_frame_header,
+        labels_df,
+        stride_map,
+        continuous=(label_mode == "continuous"),
+        continuous_offsets_25fps=args.continuous_offsets_25fps,
     )
     total_positive_frames = sum(len(v) for v in label_lookup.values())
     print(
@@ -617,8 +698,10 @@ def main() -> None:
     # ── Step 6: Process each video half (dense detection) ──
     all_chunks: List[pd.DataFrame] = []
     failed_records: List[Dict] = []
+    failed_frame_records: List[Dict] = []
     total_ball_detected = 0
     total_frames_processed = 0
+    total_rows_dropped_window = 0
     t_start = time.perf_counter()
 
     for key, source in tqdm(sources.items(), desc="Processing videos"):
@@ -719,9 +802,54 @@ def main() -> None:
             stride,
         )
 
+        rows_before_filter = len(records)
+        records, dropped_window, dropped_records = filter_records_by_model_window(
+            records,
+            model_num_frames=args.model_num_frames,
+            frame_count=requested_frames,
+        )
+        total_rows_dropped_window += dropped_window
+        if dropped_records:
+            for dropped in dropped_records:
+                failed_frame_records.append(
+                    {
+                        "video_id": source.match_name,
+                        "half": source.half,
+                        "key": key,
+                        "path": str(source.path),
+                        "frame": int(dropped["frame"]),
+                        "label": int(dropped["label"]),
+                        "reason": "missing_model_window_frames",
+                        "model_num_frames": int(args.model_num_frames),
+                        "requested_frames": requested_frames,
+                    }
+                )
+        if dropped_window > 0:
+            print(
+                f"[WARN] {key}: dropped {dropped_window}/{rows_before_filter} rows "
+                f"with incomplete model window (num_frames={args.model_num_frames})"
+            )
+
         if records:
             chunk_df = pd.DataFrame(records)
             all_chunks.append(chunk_df)
+        else:
+            elapsed = time.perf_counter() - t_video
+            failed_records.append(
+                {
+                    "video_id": source.match_name,
+                    "half": source.half,
+                    "key": key,
+                    "path": str(source.path),
+                    "requested_frames": requested_frames,
+                    "read_frames": decoded,
+                    "read_ratio": round(read_ratio, 4),
+                    "reason": "no_valid_rows_after_window_filter",
+                    "model_num_frames": args.model_num_frames,
+                    "elapsed_seconds": round(elapsed, 2),
+                }
+            )
+            continue
 
         elapsed = time.perf_counter() - t_video
         ball_rate = len(smoothed_ball) / decoded * 100 if decoded else 0
@@ -765,6 +893,8 @@ def main() -> None:
         {
             b"generator": b"generate_dense_dataset.py",
             b"label_mode": label_mode.encode(),
+            b"continuous_offsets_25fps": json.dumps(args.continuous_offsets_25fps).encode(),
+            b"model_num_frames": str(args.model_num_frames).encode(),
             b"confidence_threshold": str(args.confidence_threshold).encode(),
             b"creation_date": datetime.now().isoformat().encode(),
         }
@@ -774,7 +904,7 @@ def main() -> None:
 
     total_time = time.perf_counter() - t_start
 
-    # ── Step 8: Save failures ──
+    # ── Step 8: Save failed videos ──
     if failed_records:
         failed_df = pd.DataFrame(failed_records)
         failed_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -782,6 +912,18 @@ def main() -> None:
         print(f"[WARN] Logged {len(failed_df)} failed video(s) to {failed_log_path}")
     elif failed_log_path.exists():
         failed_log_path.unlink()
+
+    # ── Step 8b: Save failed frames ──
+    if failed_frame_records:
+        failed_frames_df = pd.DataFrame(failed_frame_records)
+        failed_frame_log_path.parent.mkdir(parents=True, exist_ok=True)
+        failed_frames_df.to_csv(failed_frame_log_path, index=False)
+        print(
+            f"[WARN] Logged {len(failed_frames_df)} failed frame(s) "
+            f"to {failed_frame_log_path}"
+        )
+    elif failed_frame_log_path.exists():
+        failed_frame_log_path.unlink()
 
     # ── Step 9: Summary ──
     ball_rate = total_ball_detected / total_frames_processed * 100 if total_frames_processed else 0
@@ -794,7 +936,9 @@ def main() -> None:
     print(f"  Label mode:       {label_mode}")
     print(f"  Videos processed: {len(sources) - len(failed_records)}")
     print(f"  Videos failed:    {len(failed_records)}")
+    print(f"  Failed frames:    {len(failed_frame_records):,}")
     print(f"  Total frames:     {len(df):,}")
+    print(f"  Dropped windows:  {total_rows_dropped_window:,}")
     print(f"  Ball detected:    {total_ball_detected:,} / {total_frames_processed:,} ({ball_rate:.1f}%)")
     print(f"  Label=0:          {label_dist.get(0, 0):,}")
     print(f"  Label=1:          {label_dist.get(1, 0):,}")

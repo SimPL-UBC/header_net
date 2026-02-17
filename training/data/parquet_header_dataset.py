@@ -146,12 +146,10 @@ class DeterministicRatioSampler(Sampler[int]):
         if self.neg_pos_ratio is None:
             neg = self.negative_indices
         else:
-            target_neg = min(
-                len(self.negative_indices),
-                len(self.positive_indices) * self.neg_pos_ratio,
-            )
-            if target_neg > 0:
-                neg = rng.choice(self.negative_indices, size=target_neg, replace=False)
+            target_neg = len(self.positive_indices) * self.neg_pos_ratio
+            if target_neg > 0 and len(self.negative_indices) > 0:
+                replace = len(self.negative_indices) < target_neg
+                neg = rng.choice(self.negative_indices, size=target_neg, replace=replace)
             else:
                 neg = np.array([], dtype=np.int64)
 
@@ -191,6 +189,7 @@ class ParquetHeaderDataset(Dataset):
         max_open_videos: int = 8,
         crop_scale_factor: float = 4.5,
         default_radius: int = 100,
+        max_resample_attempts: int = 20,
     ):
         self.parquet_path = Path(parquet_path)
         if not self.parquet_path.exists():
@@ -202,6 +201,7 @@ class ParquetHeaderDataset(Dataset):
         self.strict_paths = strict_paths
         self.dataset_root = Path(dataset_root) if dataset_root else None
         self.window_offsets = _build_window_offsets(self.num_frames)
+        self.max_resample_attempts = max(1, int(max_resample_attempts))
         self.cropper = FrameCropper(
             crop_scale_factor=crop_scale_factor,
             output_size=self.input_size,
@@ -272,8 +272,8 @@ class ParquetHeaderDataset(Dataset):
 
         return {"box": [x, y, w, h]}
 
-    def _load_window_frames(self, video_path: str, center_frame: int) -> list:
-        frame_count, width, height = self.reader_pool.get_meta(video_path)
+    def _load_window_frames(self, video_path: str, center_frame: int) -> Optional[list]:
+        frame_count, _, _ = self.reader_pool.get_meta(video_path)
         if frame_count <= 0:
             raise RuntimeError(f"Video has no frames: {video_path}")
 
@@ -284,9 +284,15 @@ class ParquetHeaderDataset(Dataset):
         for idx in clamped.tolist():
             frame = self.reader_pool.read_frame(video_path, int(idx))
             if frame is None:
-                frame = np.zeros((height, width, 3), dtype=np.uint8)
+                return None
             frames.append(frame)
         return frames
+
+    def _sample_replacement_row(self, label: int) -> Optional[int]:
+        candidates = self.positive_indices if label == 1 else self.negative_indices
+        if len(candidates) == 0:
+            return None
+        return int(candidates[np.random.randint(0, len(candidates))])
 
     def _apply_spatial_policy(self, frames: list, center_det: Optional[Dict]) -> list:
         # If the center frame has no ball, use full-frame resize via transform path.
@@ -301,33 +307,46 @@ class ParquetHeaderDataset(Dataset):
 
     def __getitem__(self, idx: int):
         row_idx = int(idx)
-        video_path = self.video_paths[row_idx]
-        center_frame = int(self.frames[row_idx])
-        label = int(self.labels[row_idx])
+        target_label = int(self.labels[row_idx])
 
-        frames = self._load_window_frames(video_path, center_frame)
-        center_det = self._build_center_detection(row_idx)
-        frames = self._apply_spatial_policy(frames, center_det)
+        for _ in range(self.max_resample_attempts):
+            video_path = self.video_paths[row_idx]
+            center_frame = int(self.frames[row_idx])
 
-        processed = []
-        for frame in frames:
-            img = Image.fromarray(frame.astype("uint8"), "RGB")
-            if self.transform is not None:
-                tensor = self.transform(img)
-            else:
-                tensor = T.ToTensor()(img)
-            processed.append(tensor)
+            frames = self._load_window_frames(video_path, center_frame)
+            if frames is None:
+                replacement = self._sample_replacement_row(target_label)
+                if replacement is None:
+                    break
+                row_idx = replacement
+                continue
 
-        video = torch.stack(processed, dim=0).permute(1, 0, 2, 3)
+            center_det = self._build_center_detection(row_idx)
+            frames = self._apply_spatial_policy(frames, center_det)
 
-        meta = {
-            "video_id": str(self.video_ids[row_idx]),
-            "half": str(self.halves[row_idx]),
-            "frame": int(center_frame),
-            "path": str(video_path),
-            "row_idx": int(row_idx),
-        }
-        return video, label, meta
+            processed = []
+            for frame in frames:
+                img = Image.fromarray(frame.astype("uint8"), "RGB")
+                if self.transform is not None:
+                    tensor = self.transform(img)
+                else:
+                    tensor = T.ToTensor()(img)
+                processed.append(tensor)
+
+            video = torch.stack(processed, dim=0).permute(1, 0, 2, 3)
+            meta = {
+                "video_id": str(self.video_ids[row_idx]),
+                "half": str(self.halves[row_idx]),
+                "frame": int(center_frame),
+                "path": str(video_path),
+                "row_idx": int(row_idx),
+            }
+            return video, target_label, meta
+
+        raise RuntimeError(
+            f"Unable to decode a valid sample after {self.max_resample_attempts} attempts "
+            f"for target label {target_label}"
+        )
 
     def class_counts(self) -> Dict[str, int]:
         return {

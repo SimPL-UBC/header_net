@@ -22,6 +22,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # SAVE_EPOCH_INDICES: true|false
 # VALIDATE_VIDEO_LOAD: 1 to verify parquet video paths can be opened/decoded before training (default: 1)
 # VALIDATE_VIDEO_LOAD_MAX_ERRORS: max unreadable paths to print (default: 20)
+# FILTER_BAD_WINDOWS: optional legacy pre-filter pass before training (default: 0)
+#   Dense parquet generator now drops rows with incomplete model windows.
+# FILTER_BAD_WINDOWS_FORCE_REBUILD: 1 to rebuild filtered parquet even if cached output exists (default: 0)
+# FILTER_BAD_WINDOWS_OUTPUT_DIR: directory for filtered parquet cache/reports (default: ${REPO_ROOT}/output/dense_dataset/filtered_windows)
+# FILTER_BAD_WINDOWS_CHUNK_SIZE: row chunk size for vectorized filtering (default: 200000)
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 if [[ ! -f "${CONDA_SH}" ]]; then
@@ -69,6 +74,48 @@ GPUS="${GPUS:-0 1}"
 SAVE_EPOCH_INDICES="${SAVE_EPOCH_INDICES:-true}"
 VALIDATE_VIDEO_LOAD="${VALIDATE_VIDEO_LOAD:-1}"
 VALIDATE_VIDEO_LOAD_MAX_ERRORS="${VALIDATE_VIDEO_LOAD_MAX_ERRORS:-20}"
+FILTER_BAD_WINDOWS="${FILTER_BAD_WINDOWS:-0}"
+FILTER_BAD_WINDOWS_FORCE_REBUILD="${FILTER_BAD_WINDOWS_FORCE_REBUILD:-0}"
+FILTER_BAD_WINDOWS_OUTPUT_DIR="${FILTER_BAD_WINDOWS_OUTPUT_DIR:-${REPO_ROOT}/output/dense_dataset/filtered_windows}"
+FILTER_BAD_WINDOWS_CHUNK_SIZE="${FILTER_BAD_WINDOWS_CHUNK_SIZE:-200000}"
+
+if [[ "${FILTER_BAD_WINDOWS}" == "1" ]]; then
+  mkdir -p "${FILTER_BAD_WINDOWS_OUTPUT_DIR}"
+
+  TRAIN_STEM="$(basename "${TRAIN_PARQUET%.parquet}")"
+  VAL_STEM="$(basename "${VAL_PARQUET%.parquet}")"
+
+  TRAIN_PARQUET_FILTERED="${FILTER_BAD_WINDOWS_OUTPUT_DIR}/${TRAIN_STEM}.valid_window_nf${NUM_FRAMES}.parquet"
+  VAL_PARQUET_FILTERED="${FILTER_BAD_WINDOWS_OUTPUT_DIR}/${VAL_STEM}.valid_window_nf${NUM_FRAMES}.parquet"
+  TRAIN_FILTER_REPORT="${FILTER_BAD_WINDOWS_OUTPUT_DIR}/${TRAIN_STEM}.valid_window_nf${NUM_FRAMES}.report.csv"
+  VAL_FILTER_REPORT="${FILTER_BAD_WINDOWS_OUTPUT_DIR}/${VAL_STEM}.valid_window_nf${NUM_FRAMES}.report.csv"
+
+  filter_split() {
+    local split_name="$1"
+    local input_parquet="$2"
+    local output_parquet="$3"
+    local report_csv="$4"
+
+    if [[ "${FILTER_BAD_WINDOWS_FORCE_REBUILD}" != "1" && -f "${output_parquet}" ]]; then
+      echo "[INFO] Reusing filtered ${split_name} parquet: ${output_parquet}"
+      return
+    fi
+
+    echo "[INFO] Filtering ${split_name} parquet windows..."
+    "${PYTHON_BIN}" "${REPO_ROOT}/tools/filter_parquet_decode_windows.py" \
+      --input-parquet "${input_parquet}" \
+      --output-parquet "${output_parquet}" \
+      --num-frames "${NUM_FRAMES}" \
+      --chunk-size "${FILTER_BAD_WINDOWS_CHUNK_SIZE}" \
+      --report-csv "${report_csv}"
+  }
+
+  filter_split "train" "${TRAIN_PARQUET}" "${TRAIN_PARQUET_FILTERED}" "${TRAIN_FILTER_REPORT}"
+  filter_split "val" "${VAL_PARQUET}" "${VAL_PARQUET_FILTERED}" "${VAL_FILTER_REPORT}"
+
+  TRAIN_PARQUET="${TRAIN_PARQUET_FILTERED}"
+  VAL_PARQUET="${VAL_PARQUET_FILTERED}"
+fi
 
 if [[ "${VALIDATE_VIDEO_LOAD}" == "1" ]]; then
   echo "[INFO] Validating video readability from train/val parquet files..."

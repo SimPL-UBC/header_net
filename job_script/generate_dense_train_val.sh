@@ -7,7 +7,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # Env overrides:
-# LABEL_MODE: "one_frame" or "continuous" (default: one_frame)
+# LABEL_MODE: "one_frame" or "continuous" (default: continuous)
+# CONTINUOUS_OFFSETS_25FPS: space-separated offsets for continuous labels at 25fps
+#   default: "-1 0 1 2 3" (50fps uses stride=2 => "-2 0 2 4 6")
+# MODEL_NUM_FRAMES: model clip length used for window-valid row filtering (default: 16)
+#   For NUM_FRAMES=16, model input offsets at 25fps are: -8 -7 -6 -5 -4 -3 -2 -1 0 1 2 3 4 5 6 7
 # WEIGHTS_PATH: path to SoccerNet RF-DETR weights
 # CONF_THRESHOLD: detection confidence threshold (default: 0.25)
 # BATCH_SIZE: inference batch size (default: 8)
@@ -56,7 +60,9 @@ PY
 fi
 
 # Configurable options.
-LABEL_MODE="${LABEL_MODE:-one_frame}"
+LABEL_MODE="${LABEL_MODE:-continuous}"
+CONTINUOUS_OFFSETS_25FPS="${CONTINUOUS_OFFSETS_25FPS:--1 0 1 2 3}"
+MODEL_NUM_FRAMES="${MODEL_NUM_FRAMES:-16}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${REPO_ROOT}/RFDETR-Soccernet/weights/checkpoint_best_regular.pth}"
 CONF_THRESHOLD="${CONF_THRESHOLD:-0.25}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
@@ -102,8 +108,19 @@ COMMON_ARGS=(
 	--confidence-threshold "${CONF_THRESHOLD}"
 	--batch-size "${BATCH_SIZE}"
 	--topk "${TOPK}"
+	--model-num-frames "${MODEL_NUM_FRAMES}"
 	"${LABEL_FLAG}"
 )
+
+if [[ "${LABEL_MODE}" == "continuous" ]]; then
+	# shellcheck disable=SC2206
+	CONTINUOUS_OFFSETS_ARR=(${CONTINUOUS_OFFSETS_25FPS})
+	if [[ "${#CONTINUOUS_OFFSETS_ARR[@]}" -eq 0 ]]; then
+		echo "[ERROR] CONTINUOUS_OFFSETS_25FPS cannot be empty in continuous mode." >&2
+		exit 1
+	fi
+	COMMON_ARGS+=(--continuous-offsets-25fps "${CONTINUOUS_OFFSETS_ARR[@]}")
+fi
 
 if [[ -n "${DEVICE}" ]]; then
 	COMMON_ARGS+=(--device "${DEVICE}")
@@ -129,6 +146,8 @@ TRAIN_OUTPUT="${OUTPUT_BASE}/dense_train.parquet"
 VAL_OUTPUT="${OUTPUT_BASE}/dense_val.parquet"
 TRAIN_FAILED_LOG="${OUTPUT_BASE}/dense_train_failed_videos.csv"
 VAL_FAILED_LOG="${OUTPUT_BASE}/dense_val_failed_videos.csv"
+TRAIN_FAILED_FRAME_LOG="${OUTPUT_BASE}/dense_train_failed_frames.csv"
+VAL_FAILED_FRAME_LOG="${OUTPUT_BASE}/dense_val_failed_frames.csv"
 
 cleanup_heavily_corrupted_videos() {
 	local failed_csv="$1"
@@ -201,6 +220,7 @@ run_split() {
 	local labels_dir="$4"
 	local output_path="$5"
 	local failed_log_path="$6"
+	local failed_frame_log_path="$7"
 
 	local status=0
 	if CUDA_VISIBLE_DEVICES="${gpu_id}" "${PYTHON_BIN}" \
@@ -209,6 +229,7 @@ run_split() {
 		--labels-dir "${labels_dir}" \
 		--output-path "${output_path}" \
 		--failed-log-path "${failed_log_path}" \
+		--failed-frame-log-path "${failed_frame_log_path}" \
 		--min-decode-ratio "${MIN_DECODE_RATIO}" \
 		"${COMMON_ARGS[@]}"; then
 		:
@@ -223,6 +244,10 @@ run_split() {
 echo "============================================================"
 echo "Dense dataset generation — ${LABEL_MODE} mode (2 GPUs)"
 echo "============================================================"
+echo "Model num frames: ${MODEL_NUM_FRAMES}"
+if [[ "${LABEL_MODE}" == "continuous" ]]; then
+	echo "Continuous offsets @25fps: ${CONTINUOUS_OFFSETS_25FPS}"
+fi
 echo "Min decode ratio: ${MIN_DECODE_RATIO}"
 echo "Strict decode errors: ${STRICT_DECODE_ERRORS} (ffmpeg=${FFMPEG_BIN})"
 echo "Delete heavily corrupted videos: ${REMOVE_HEAVILY_CORRUPTED}"
@@ -231,10 +256,10 @@ echo "Delete heavily corrupted videos: ${REMOVE_HEAVILY_CORRUPTED}"
 echo ""
 echo "[PARALLEL] Train → GPU 0 | Val → GPU 1"
 
-run_split "train" "0" "${REPO_ROOT}/SoccerNet/train" "${REPO_ROOT}/SoccerNet/train/labelled_header" "${TRAIN_OUTPUT}" "${TRAIN_FAILED_LOG}" &
+run_split "train" "0" "${REPO_ROOT}/SoccerNet/train" "${REPO_ROOT}/SoccerNet/train/labelled_header" "${TRAIN_OUTPUT}" "${TRAIN_FAILED_LOG}" "${TRAIN_FAILED_FRAME_LOG}" &
 PID_TRAIN=$!
 
-run_split "val" "1" "${REPO_ROOT}/SoccerNet/val" "${REPO_ROOT}/SoccerNet/val/labelled_header" "${VAL_OUTPUT}" "${VAL_FAILED_LOG}" &
+run_split "val" "1" "${REPO_ROOT}/SoccerNet/val" "${REPO_ROOT}/SoccerNet/val/labelled_header" "${VAL_OUTPUT}" "${VAL_FAILED_LOG}" "${VAL_FAILED_FRAME_LOG}" &
 PID_VAL=$!
 
 FAIL=0
@@ -253,4 +278,7 @@ echo "  Val:   ${VAL_OUTPUT}"
 echo "Failed logs:"
 echo "  Train: ${TRAIN_FAILED_LOG}"
 echo "  Val:   ${VAL_FAILED_LOG}"
+echo "Failed frame logs:"
+echo "  Train: ${TRAIN_FAILED_FRAME_LOG}"
+echo "  Val:   ${VAL_FAILED_FRAME_LOG}"
 echo "============================================================"
