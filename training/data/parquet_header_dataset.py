@@ -430,12 +430,13 @@ def build_parquet_dataloaders(config: Config):
         generator=generator,
     )
 
+    val_num_workers = int(getattr(config, "val_num_workers", 0))
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True,
+        num_workers=val_num_workers,
+        pin_memory=False,
         worker_init_fn=_seed_worker,
         generator=generator,
     )

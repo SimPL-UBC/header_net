@@ -61,6 +61,12 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of workers")
     parser.add_argument(
+        "--val_num_workers",
+        type=int,
+        default=0,
+        help="Validation DataLoader workers (use 0 for stability)",
+    )
+    parser.add_argument(
         "--optimizer",
         default="adamw",
         choices=["adamw", "sgd"],
@@ -206,6 +212,10 @@ def main():
     print(f"Backbone: {config.backbone}")
     print(f"Negative:positive ratio: {config.neg_pos_ratio}")
     print(f"Base LR scaled: {args.base_lr} * ({config.batch_size}/256) = {scaled_lr:.6g}")
+    print(
+        "Dataloader workers: "
+        f"train={config.num_workers}, val={config.val_num_workers}"
+    )
 
     if config.gpus and torch.cuda.is_available():
         device = torch.device(f"cuda:{config.gpus[0]}")
@@ -281,7 +291,26 @@ def main():
             f"F1: {train_metrics['train_f1']:.4f}"
         )
 
-        val_metrics_raw, val_preds = trainer.validate(model, val_loader, epoch)
+        try:
+            val_metrics_raw, val_preds = trainer.validate(model, val_loader, epoch)
+        except RuntimeError as err:
+            err_text = str(err)
+            worker_crash = "DataLoader worker" in err_text and "exited unexpectedly" in err_text
+            if not worker_crash:
+                raise
+
+            print(
+                "Validation DataLoader worker crashed. "
+                "Retrying validation with num_workers=0 and pin_memory=False."
+            )
+            val_loader = torch.utils.data.DataLoader(
+                val_loader.dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+            )
+            val_metrics_raw, val_preds = trainer.validate(model, val_loader, epoch)
         labels = np.array([int(p["label"]) for p in val_preds], dtype=np.int64)
         probs = np.array([float(p["prob_header"]) for p in val_preds], dtype=np.float64)
         sweep = _threshold_sweep_positive_f1(

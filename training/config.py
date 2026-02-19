@@ -32,6 +32,7 @@ class Config:
     epochs: int = 50
     batch_size: int = 16
     num_workers: int = 8
+    val_num_workers: int = 0
 
     # Loss
     loss_type: str = "focal"
@@ -97,6 +98,8 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.batch_size = args.batch_size
     if hasattr(args, "num_workers"):
         config.num_workers = args.num_workers
+    if hasattr(args, "val_num_workers"):
+        config.val_num_workers = args.val_num_workers
 
     # Run
     if hasattr(args, "run_name"):
