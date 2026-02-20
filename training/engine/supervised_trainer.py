@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import time
 from sklearn.metrics import f1_score
 from ..eval.metrics import compute_classification_metrics
 
@@ -91,9 +92,12 @@ class Trainer:
         all_labels = []
         all_probs = []
         predictions_list = []
+        total_batches = len(val_loader) if hasattr(val_loader, "__len__") else None
+        progress_every = 1000
+        start_time = time.time()
         
         with torch.no_grad():
-            for inputs, targets, meta in val_loader:
+            for batch_idx, (inputs, targets, meta) in enumerate(val_loader, start=1):
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 
@@ -125,6 +129,24 @@ class Trainer:
                         "pred_label": preds[k].item()
                     }
                     predictions_list.append(pred_dict)
+
+                if batch_idx % progress_every == 0:
+                    elapsed = max(time.time() - start_time, 1e-6)
+                    rate = batch_idx / elapsed
+                    if total_batches is not None:
+                        print(
+                            f"[VAL][Epoch {epoch}] "
+                            f"{batch_idx}/{total_batches} batches "
+                            f"({rate:.2f} batches/s)",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[VAL][Epoch {epoch}] "
+                            f"{batch_idx} batches "
+                            f"({rate:.2f} batches/s)",
+                            flush=True,
+                        )
                     
         total = len(all_labels)
         epoch_loss = running_loss / total if total > 0 else 0.0

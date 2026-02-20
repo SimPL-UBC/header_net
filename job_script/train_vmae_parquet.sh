@@ -18,6 +18,10 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # OPTIMIZER, BASE_LR, LAYER_LR_DECAY, BETAS, WEIGHT_DECAY
 # LOSS, FOCAL_GAMMA, FOCAL_ALPHA
 # F1_THRESHOLD_STEP
+# RUN_INTERMEDIATE_VALIDATION: true|false to enable validation during training epochs
+# VALIDATE_EVERY_N_EPOCHS: when intermediate validation is enabled, run it every N epochs
+# VAL_NEG_POS_RATIO: intermediate validation negative:positive ratio (all|positive integer)
+# RUN_FINAL_TEST: true|false to run one parquet test pass after training (default: true)
 # SEED, GPUS
 # SAVE_EPOCH_INDICES: true|false
 # VALIDATE_VIDEO_LOAD: 1 to verify parquet video paths can be opened/decoded before training (default: 1)
@@ -70,6 +74,10 @@ LOSS="${LOSS:-focal}"
 FOCAL_GAMMA="${FOCAL_GAMMA:-2.0}"
 FOCAL_ALPHA="${FOCAL_ALPHA:-0.75}"
 F1_THRESHOLD_STEP="${F1_THRESHOLD_STEP:-0.01}"
+RUN_INTERMEDIATE_VALIDATION="${RUN_INTERMEDIATE_VALIDATION:-true}"
+VALIDATE_EVERY_N_EPOCHS="${VALIDATE_EVERY_N_EPOCHS:-1}"
+VAL_NEG_POS_RATIO="${VAL_NEG_POS_RATIO:-all}"
+RUN_FINAL_TEST="${RUN_FINAL_TEST:-true}"
 SEED="${SEED:-42}"
 GPUS="${GPUS:-0 1}"
 SAVE_EPOCH_INDICES="${SAVE_EPOCH_INDICES:-true}"
@@ -199,6 +207,8 @@ ARGS=(
   --focal_gamma "${FOCAL_GAMMA}"
   --focal_alpha "${FOCAL_ALPHA}"
   --f1_threshold_step "${F1_THRESHOLD_STEP}"
+  --validate_every_n_epochs "${VALIDATE_EVERY_N_EPOCHS}"
+  --val_neg_pos_ratio "${VAL_NEG_POS_RATIO}"
   --seed "${SEED}"
   --gpus ${GPUS}
 )
@@ -207,6 +217,18 @@ if [[ "${SAVE_EPOCH_INDICES}" == "true" ]]; then
   ARGS+=(--save_epoch_indices)
 else
   ARGS+=(--no-save_epoch_indices)
+fi
+
+if [[ "${RUN_INTERMEDIATE_VALIDATION}" == "true" ]]; then
+  ARGS+=(--run_intermediate_validation)
+else
+  ARGS+=(--no-run_intermediate_validation)
+fi
+
+if [[ "${RUN_FINAL_TEST}" == "true" ]]; then
+  ARGS+=(--run_final_test)
+else
+  ARGS+=(--no-run_final_test)
 fi
 
 "${PYTHON_BIN}" "${ARGS[@]}"
