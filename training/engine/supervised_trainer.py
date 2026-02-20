@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import time
 from sklearn.metrics import f1_score
+from tqdm import tqdm
 from ..eval.metrics import compute_classification_metrics
 
 
@@ -60,9 +61,17 @@ class Trainer:
         total = 0
         all_preds = []
         all_labels = []
-        
+
+        progress = tqdm(
+            train_loader,
+            desc=f"Train Epoch {epoch}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        )
+
         # train_loader yields (inputs, targets, meta)
-        for i, (inputs, targets, _) in enumerate(train_loader):
+        for inputs, targets, _ in progress:
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
             
@@ -78,6 +87,14 @@ class Trainer:
             correct += (predicted == targets).sum().item()
             all_preds.extend(predicted.detach().cpu().numpy())
             all_labels.extend(targets.detach().cpu().numpy())
+
+            if total > 0:
+                progress.set_postfix(
+                    loss=f"{running_loss / total:.4f}",
+                    acc=f"{correct / total:.4f}",
+                    f1=f"{f1_score(all_labels, all_preds, zero_division=0):.4f}",
+                    refresh=False,
+                )
             
         epoch_loss = running_loss / total if total > 0 else 0.0
         epoch_acc = correct / total if total > 0 else 0.0
