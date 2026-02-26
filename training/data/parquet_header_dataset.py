@@ -384,10 +384,14 @@ def get_transforms(input_size: int = 224, is_training: bool = True):
     )
 
 
-def build_parquet_dataloaders(config: Config):
-    train_transform = get_transforms(config.input_size, is_training=True)
-    val_transform = get_transforms(config.input_size, is_training=False)
+def _build_torch_generator(seed: int) -> torch.Generator:
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return generator
 
+
+def build_parquet_train_dataloader(config: Config):
+    train_transform = get_transforms(config.input_size, is_training=True)
     train_dataset = ParquetHeaderDataset(
         parquet_path=config.train_parquet,
         num_frames=config.num_frames,
@@ -397,6 +401,41 @@ def build_parquet_dataloaders(config: Config):
         dataset_root=config.dataset_root,
     )
 
+    if len(train_dataset.positive_indices) == 0:
+        raise ValueError("Training parquet has no positive samples (label=1).")
+
+    train_sampler = DeterministicRatioSampler(
+        positive_indices=train_dataset.positive_indices,
+        negative_indices=train_dataset.negative_indices,
+        neg_pos_ratio=config.neg_pos_ratio,
+        seed=config.seed,
+        shuffle=True,
+    )
+
+    generator = _build_torch_generator(config.seed)
+    num_workers = int(getattr(config, "num_workers", 0))
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        sampler=train_sampler,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        worker_init_fn=_seed_worker,
+        generator=generator,
+        persistent_workers=bool(num_workers > 0),
+    )
+    return train_loader, train_dataset, train_sampler
+
+
+def build_parquet_val_dataloader(
+    config: Config,
+    neg_pos_ratio: Union[str, int] = "all",
+    seed_offset: int = 1000,
+    shuffle: bool = True,
+    pin_memory: Optional[bool] = None,
+):
+    val_transform = get_transforms(config.input_size, is_training=False)
     val_dataset = ParquetHeaderDataset(
         parquet_path=config.val_parquet,
         num_frames=config.num_frames,
@@ -406,39 +445,49 @@ def build_parquet_dataloaders(config: Config):
         dataset_root=config.dataset_root,
     )
 
-    train_sampler = DeterministicRatioSampler(
-        positive_indices=train_dataset.positive_indices,
-        negative_indices=train_dataset.negative_indices,
-        neg_pos_ratio=config.neg_pos_ratio,
-        seed=config.seed,
-        shuffle=True,
-    )
-    if len(train_dataset.positive_indices) == 0:
-        raise ValueError("Training parquet has no positive samples (label=1).")
+    val_sampler = None
+    ratio = _parse_neg_pos_ratio(neg_pos_ratio)
+    if ratio is not None:
+        if len(val_dataset.positive_indices) == 0:
+            raise ValueError(
+                "Validation parquet has no positive samples but val_neg_pos_ratio was set."
+            )
+        val_sampler = DeterministicRatioSampler(
+            positive_indices=val_dataset.positive_indices,
+            negative_indices=val_dataset.negative_indices,
+            neg_pos_ratio=ratio,
+            seed=int(config.seed) + int(seed_offset),
+            shuffle=shuffle,
+        )
 
-    generator = torch.Generator()
-    generator.manual_seed(config.seed)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        sampler=train_sampler,
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True,
-        worker_init_fn=_seed_worker,
-        generator=generator,
-    )
-
+    generator = _build_torch_generator(config.seed)
     val_num_workers = int(getattr(config, "val_num_workers", 0))
+    resolved_pin_memory = (
+        bool(getattr(config, "val_pin_memory", False))
+        if pin_memory is None
+        else bool(pin_memory)
+    )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=val_num_workers,
-        pin_memory=False,
+        pin_memory=resolved_pin_memory,
         worker_init_fn=_seed_worker,
         generator=generator,
+        persistent_workers=bool(val_num_workers > 0),
     )
+    return val_loader, val_dataset, val_sampler
 
+
+def build_parquet_dataloaders(config: Config):
+    train_loader, train_dataset, train_sampler = build_parquet_train_dataloader(config)
+    val_loader, val_dataset, _ = build_parquet_val_dataloader(
+        config,
+        neg_pos_ratio="all",
+        seed_offset=1000,
+        shuffle=True,
+        pin_memory=False,
+    )
     return train_loader, val_loader, train_dataset, val_dataset, train_sampler

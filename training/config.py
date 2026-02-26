@@ -47,10 +47,13 @@ class Config:
     layer_lr_decay: float = 0.75
     f1_threshold_step: float = 0.01
     save_epoch_indices: bool = True
+    save_every_n_epochs: int = 1
     run_intermediate_validation: bool = True
     validate_every_n_epochs: int = 1
     val_neg_pos_ratio: str = "all"
     run_final_test: bool = True
+    val_pin_memory: bool = False
+    val_progress_every: int = 1000
 
 
 def merge_cli_args(args: argparse.Namespace) -> Config:
@@ -128,6 +131,8 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.f1_threshold_step = args.f1_threshold_step
     if hasattr(args, "save_epoch_indices"):
         config.save_epoch_indices = args.save_epoch_indices
+    if hasattr(args, "save_every_n_epochs"):
+        config.save_every_n_epochs = args.save_every_n_epochs
     if hasattr(args, "run_intermediate_validation"):
         config.run_intermediate_validation = args.run_intermediate_validation
     if hasattr(args, "validate_every_n_epochs"):
@@ -136,5 +141,9 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.val_neg_pos_ratio = str(args.val_neg_pos_ratio)
     if hasattr(args, "run_final_test"):
         config.run_final_test = args.run_final_test
+    if hasattr(args, "val_pin_memory"):
+        config.val_pin_memory = args.val_pin_memory
+    if hasattr(args, "val_progress_every"):
+        config.val_progress_every = args.val_progress_every
 
     return config

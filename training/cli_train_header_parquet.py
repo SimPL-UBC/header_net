@@ -32,8 +32,7 @@ def parse_args():
     parser.add_argument(
         "--neg_pos_ratio",
         default="all",
-        choices=["10", "20", "30", "all"],
-        help="Train negative:positive ratio; 'all' uses full dataset",
+        help="Train negative:positive ratio; 'all' or a positive integer",
     )
 
     parser.add_argument(
@@ -302,6 +301,7 @@ def _run_validation_with_retry(trainer, model, val_loader, config, epoch_label):
 def main():
     args = parse_args()
     config = merge_cli_args(args)
+    _parse_optional_ratio(config.neg_pos_ratio, "neg_pos_ratio")
 
     scale = config.batch_size / 256.0
     scaled_lr = config.base_lr * scale

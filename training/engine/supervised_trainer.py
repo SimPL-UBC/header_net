@@ -110,10 +110,10 @@ class Trainer:
         all_probs = []
         predictions_list = []
         total_batches = len(val_loader) if hasattr(val_loader, "__len__") else None
-        progress_every = 1000
+        progress_every = max(1, int(getattr(self.config, "val_progress_every", 1000)))
         start_time = time.time()
         
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch_idx, (inputs, targets, meta) in enumerate(val_loader, start=1):
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
