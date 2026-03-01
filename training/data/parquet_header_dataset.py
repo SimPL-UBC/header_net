@@ -31,7 +31,6 @@ REQUIRED_PARQUET_COLUMNS = [
     "ball_h",
 ]
 
-
 def _parse_neg_pos_ratio(value: Union[str, int]) -> Optional[int]:
     if isinstance(value, int):
         if value <= 0:
@@ -190,6 +189,7 @@ class ParquetHeaderDataset(Dataset):
         crop_scale_factor: float = 4.5,
         default_radius: int = 100,
         max_resample_attempts: int = 20,
+        resample_on_decode_failure: bool = True,
     ):
         self.parquet_path = Path(parquet_path)
         if not self.parquet_path.exists():
@@ -202,6 +202,7 @@ class ParquetHeaderDataset(Dataset):
         self.dataset_root = Path(dataset_root) if dataset_root else None
         self.window_offsets = _build_window_offsets(self.num_frames)
         self.max_resample_attempts = max(1, int(max_resample_attempts))
+        self.resample_on_decode_failure = bool(resample_on_decode_failure)
         self.cropper = FrameCropper(
             crop_scale_factor=crop_scale_factor,
             output_size=self.input_size,
@@ -209,7 +210,9 @@ class ParquetHeaderDataset(Dataset):
         )
         self.reader_pool = _VideoReaderPool(max_open_videos=max_open_videos)
 
-        self.df = pd.read_parquet(self.parquet_path, columns=REQUIRED_PARQUET_COLUMNS)
+        # Load the full parquet so optional metadata columns remain available for
+        # inference/export paths without breaking older files that may omit them.
+        self.df = pd.read_parquet(self.parquet_path)
         self._validate_schema()
         self._prepare_arrays()
         self._validate_paths()
@@ -235,10 +238,17 @@ class ParquetHeaderDataset(Dataset):
         self.ball_y = pd.to_numeric(self.df["ball_y"], errors="coerce").to_numpy(np.float32)
         self.ball_w = pd.to_numeric(self.df["ball_w"], errors="coerce").to_numpy(np.float32)
         self.ball_h = pd.to_numeric(self.df["ball_h"], errors="coerce").to_numpy(np.float32)
+        self.fps = self._numeric_column("fps")
+        self.ball_confidence = self._numeric_column("ball_confidence")
 
         unique_labels = set(np.unique(self.labels).tolist())
         if not unique_labels.issubset({0, 1}):
             raise ValueError(f"Labels must be binary 0/1, got: {sorted(unique_labels)}")
+
+    def _numeric_column(self, column_name: str, default: float = np.nan) -> np.ndarray:
+        if column_name not in self.df.columns:
+            return np.full(len(self.df), default, dtype=np.float32)
+        return pd.to_numeric(self.df[column_name], errors="coerce").to_numpy(np.float32)
 
     def _validate_paths(self) -> None:
         if self.dataset_root is not None and not self.dataset_root.exists():
@@ -315,6 +325,11 @@ class ParquetHeaderDataset(Dataset):
 
             frames = self._load_window_frames(video_path, center_frame)
             if frames is None:
+                if not self.resample_on_decode_failure:
+                    raise RuntimeError(
+                        "Unable to decode temporal window for "
+                        f"row_idx={row_idx} video={video_path} frame={center_frame}"
+                    )
                 replacement = self._sample_replacement_row(target_label)
                 if replacement is None:
                     break
@@ -339,7 +354,14 @@ class ParquetHeaderDataset(Dataset):
                 "half": str(self.halves[row_idx]),
                 "frame": int(center_frame),
                 "path": str(video_path),
+                "video_path": str(video_path),
                 "row_idx": int(row_idx),
+                "fps": float(self.fps[row_idx]),
+                "ball_x": float(self.ball_x[row_idx]),
+                "ball_y": float(self.ball_y[row_idx]),
+                "ball_w": float(self.ball_w[row_idx]),
+                "ball_h": float(self.ball_h[row_idx]),
+                "ball_confidence": float(self.ball_confidence[row_idx]),
             }
             return video, target_label, meta
 
