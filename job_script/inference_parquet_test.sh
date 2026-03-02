@@ -33,13 +33,13 @@ OUTPUT_CSV="${OUTPUT_CSV:-}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/SoccerNet}"
 VIDEO_ID="${VIDEO_ID:-}"
 HALF="${HALF:-}"
-BACKBONE="${BACKBONE:-}"
 BACKBONE_CKPT="${BACKBONE_CKPT:-}"
 NUM_FRAMES="${NUM_FRAMES:-}"
 INPUT_SIZE="${INPUT_SIZE:-}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
+BATCH_SIZE="${BATCH_SIZE:-24}"
 NUM_WORKERS="${NUM_WORKERS:-12}"
-DEVICE="${DEVICE:-cuda:0}"
+GPUS="${GPUS:-0 1}"
+DEVICE="${DEVICE:-}"
 SEED="${SEED:-}"
 
 if [[ ! -f "${PARQUET}" ]]; then
@@ -63,7 +63,6 @@ ARGS=(
 	--dataset-root "${DATASET_ROOT}"
 	--batch-size "${BATCH_SIZE}"
 	--num-workers "${NUM_WORKERS}"
-	--device "${DEVICE}"
 )
 
 if [[ -n "${OUTPUT_CSV}" ]]; then
@@ -75,9 +74,6 @@ fi
 if [[ -n "${HALF}" ]]; then
 	ARGS+=(--half "${HALF}")
 fi
-if [[ -n "${BACKBONE}" ]]; then
-	ARGS+=(--backbone "${BACKBONE}")
-fi
 if [[ -n "${BACKBONE_CKPT}" ]]; then
 	ARGS+=(--backbone-ckpt "${BACKBONE_CKPT}")
 fi
@@ -86,6 +82,13 @@ if [[ -n "${NUM_FRAMES}" ]]; then
 fi
 if [[ -n "${INPUT_SIZE}" ]]; then
 	ARGS+=(--input-size "${INPUT_SIZE}")
+fi
+if [[ -n "${GPUS}" ]]; then
+	# shellcheck disable=SC2206
+	GPU_ARR=(${GPUS})
+	ARGS+=(--gpus "${GPU_ARR[@]}")
+elif [[ -n "${DEVICE}" ]]; then
+	ARGS+=(--device "${DEVICE}")
 fi
 if [[ -n "${SEED}" ]]; then
 	ARGS+=(--seed "${SEED}")

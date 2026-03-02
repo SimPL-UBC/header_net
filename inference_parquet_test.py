@@ -27,7 +27,7 @@ from training.run_utils import set_seed
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run parquet-based VMAE/CSN inference on a dense test parquet."
+        description="Run parquet-based VMAE inference on a dense test parquet."
     )
     parser.add_argument(
         "--parquet",
@@ -65,12 +65,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-id", default=None, help="Optional video_id filter")
     parser.add_argument("--half", type=int, default=None, help="Optional half filter")
     parser.add_argument(
-        "--backbone",
-        choices=["vmae", "csn"],
-        default=None,
-        help="Override checkpoint backbone",
-    )
-    parser.add_argument(
         "--backbone-ckpt",
         default=None,
         help="Override VideoMAE pretrained weights directory",
@@ -100,9 +94,16 @@ def parse_args() -> argparse.Namespace:
         help="DataLoader workers (default: %(default)s)",
     )
     parser.add_argument(
+        "--gpus",
+        type=int,
+        nargs="+",
+        default=None,
+        help="GPU IDs for VMAE inference (e.g. --gpus 0 1). Uses DataParallel when >1 GPU is supplied.",
+    )
+    parser.add_argument(
         "--device",
         default=None,
-        help="Torch device override (default: auto)",
+        help="Torch device override when --gpus is not set (default: auto)",
     )
     parser.add_argument(
         "--seed",
@@ -130,11 +131,7 @@ def resolve_from_checkpoint(
 def resolve_backbone_ckpt(
     explicit_value: str | None,
     checkpoint_config: dict[str, Any],
-    backbone: str,
 ) -> Path | None:
-    if backbone != "vmae":
-        return None
-
     candidates: list[Path] = []
     if explicit_value:
         candidates.append(Path(explicit_value).expanduser())
@@ -201,6 +198,49 @@ def batch_item(value: Any, index: int) -> Any:
     return value
 
 
+def resolve_device_config(
+    gpus_arg: list[int] | None,
+    device_arg: str | None,
+) -> tuple[torch.device, list[int]]:
+    if gpus_arg:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"GPU IDs requested ({gpus_arg}) but torch.cuda.is_available() is False."
+            )
+        available_count = torch.cuda.device_count()
+        invalid = [gpu_id for gpu_id in gpus_arg if gpu_id < 0 or gpu_id >= available_count]
+        if invalid:
+            raise RuntimeError(
+                f"Requested GPU IDs {invalid} are unavailable. "
+                f"Visible CUDA device count: {available_count}."
+            )
+        primary = torch.device(f"cuda:{gpus_arg[0]}")
+        return primary, list(gpus_arg)
+
+    if device_arg:
+        device = torch.device(device_arg)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA device requested ({device}) but torch.cuda.is_available() is False."
+            )
+        gpu_index = 0 if device.index is None else int(device.index)
+        available_count = torch.cuda.device_count()
+        if gpu_index < 0 or gpu_index >= available_count:
+            raise RuntimeError(
+                f"Requested CUDA device index {gpu_index} is unavailable. "
+                f"Visible CUDA device count: {available_count}."
+            )
+        return device, [gpu_index]
+
+    return device, []
+
+
 def main() -> None:
     args = parse_args()
 
@@ -225,24 +265,18 @@ def main() -> None:
     )
     checkpoint_config = checkpoint_payload.get("config", {}) or {}
 
-    backbone = str(resolve_from_checkpoint(args.backbone, checkpoint_config, "backbone", "vmae"))
+    checkpoint_backbone = str(checkpoint_config.get("backbone", "vmae"))
+    if checkpoint_backbone != "vmae":
+        raise ValueError(
+            f"inference_parquet_test.py is VMAE-only, but checkpoint backbone is '{checkpoint_backbone}'."
+        )
+    backbone = "vmae"
     num_frames = int(resolve_from_checkpoint(args.num_frames, checkpoint_config, "num_frames", 16))
     input_size = int(resolve_from_checkpoint(args.input_size, checkpoint_config, "input_size", 224))
     batch_size = int(resolve_from_checkpoint(args.batch_size, checkpoint_config, "batch_size", 8))
     seed = int(resolve_from_checkpoint(args.seed, checkpoint_config, "seed", 42))
-    backbone_ckpt = resolve_backbone_ckpt(args.backbone_ckpt, checkpoint_config, backbone)
-
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            f"CUDA device requested ({device}) but torch.cuda.is_available() is False."
-        )
+    backbone_ckpt = resolve_backbone_ckpt(args.backbone_ckpt, checkpoint_config)
+    device, gpu_ids = resolve_device_config(args.gpus, args.device)
 
     set_seed(seed)
 
@@ -254,6 +288,8 @@ def main() -> None:
     print(f"Num frames:     {num_frames}")
     print(f"Input size:     {input_size}")
     print(f"Batch size:     {batch_size}")
+    if gpu_ids:
+        print(f"GPUs:           {gpu_ids}")
     print(f"Device:         {device}")
 
     filter_df = pd.read_parquet(parquet_path, columns=["video_id", "half"])
@@ -300,6 +336,8 @@ def main() -> None:
         backbone_ckpt=backbone_ckpt,
     )
     model = model.to(device)
+    if len(gpu_ids) > 1:
+        model = torch.nn.DataParallel(model, device_ids=gpu_ids)
     model.eval()
 
     print(f"Evaluating {len(dataset)} samples...")
