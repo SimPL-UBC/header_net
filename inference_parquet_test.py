@@ -319,13 +319,15 @@ def main() -> None:
         else base_dataset
     )
 
+    num_workers = int(args.num_workers)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=int(args.num_workers),
+        num_workers=num_workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=bool(int(args.num_workers) > 0),
+        persistent_workers=bool(num_workers > 0),
+        prefetch_factor=1 if num_workers > 0 else None,
     )
 
     model = build_model_from_checkpoint(

@@ -31,6 +31,24 @@ REQUIRED_PARQUET_COLUMNS = [
     "ball_h",
 ]
 
+# Optional columns consumed by _prepare_arrays(); loaded when present in the file.
+_OPTIONAL_PARQUET_COLUMNS = [
+    "fps",
+    "ball_confidence",
+]
+
+
+def _columns_to_load(available_columns: list[str]) -> list[str]:
+    """Return the subset of *available_columns* that the dataset actually uses.
+
+    This avoids loading heavyweight columns such as ``other_detections`` that
+    are never accessed by ``__getitem__``, saving gigabytes of RAM on large
+    parquet files.
+    """
+    wanted = set(REQUIRED_PARQUET_COLUMNS) | set(_OPTIONAL_PARQUET_COLUMNS)
+    return [col for col in available_columns if col in wanted]
+
+
 def _parse_neg_pos_ratio(value: Union[str, int]) -> Optional[int]:
     if isinstance(value, int):
         if value <= 0:
@@ -210,12 +228,25 @@ class ParquetHeaderDataset(Dataset):
         )
         self.reader_pool = _VideoReaderPool(max_open_videos=max_open_videos)
 
-        # Load the full parquet so optional metadata columns remain available for
-        # inference/export paths without breaking older files that may omit them.
-        self.df = pd.read_parquet(self.parquet_path)
+        # Only load the columns the dataset actually uses.  This skips
+        # heavyweight columns like ``other_detections`` (JSON blobs with
+        # per-frame bounding boxes) which can consume several GB of RAM on
+        # large parquet files but are never accessed by __getitem__.
+        import pyarrow.parquet as pq
+
+        all_columns = pq.read_schema(self.parquet_path).names
+        self.df = pd.read_parquet(
+            self.parquet_path, columns=_columns_to_load(all_columns)
+        )
         self._validate_schema()
         self._prepare_arrays()
         self._validate_paths()
+
+        # Free the DataFrame now that all needed data has been extracted into
+        # numpy arrays.  With forked DataLoader workers this prevents each
+        # worker from holding a (copy-on-write-degraded) copy of the full
+        # DataFrame, which can waste tens of GB on large parquet files.
+        del self.df
 
         labels = self.labels
         self.positive_indices = np.where(labels == 1)[0].astype(np.int64)
