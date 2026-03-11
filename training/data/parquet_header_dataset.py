@@ -3,6 +3,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
+import cv2
 import decord
 import numpy as np
 import pandas as pd
@@ -39,6 +40,8 @@ _OPTIONAL_PARQUET_COLUMNS = [
     "fps",
     "ball_confidence",
 ]
+
+PREPROCESS_MODES = {"torchvision", "low_memory_eval"}
 
 
 def _factorize_strings(values: pd.Series) -> tuple[np.ndarray, tuple[str, ...]]:
@@ -156,9 +159,10 @@ class _VideoReaderPool:
             np.asarray(frame_indices, dtype=np.int64), return_inverse=True
         )
         # decord 0.6.0 returns an NDArray that supports asnumpy() but not direct
-        # Python indexing, so convert once before reconstructing duplicate indices.
+        # Python indexing, so convert once and return per-frame views instead of
+        # materializing a second full window copy via batch[inverse].
         batch = reader.get_batch(unique_indices.tolist()).asnumpy()
-        return [frame for frame in batch[inverse]]
+        return [batch[int(idx)] for idx in inverse.tolist()]
 
     def close(self) -> None:
         self._readers.clear()
@@ -238,6 +242,7 @@ class ParquetHeaderDataset(Dataset):
         default_radius: int = 100,
         max_resample_attempts: int = 20,
         resample_on_decode_failure: bool = True,
+        preprocess_mode: str = "torchvision",
     ):
         self.parquet_path = Path(parquet_path)
         if not self.parquet_path.exists():
@@ -251,12 +256,20 @@ class ParquetHeaderDataset(Dataset):
         self.window_offsets = _build_window_offsets(self.num_frames)
         self.max_resample_attempts = max(1, int(max_resample_attempts))
         self.resample_on_decode_failure = bool(resample_on_decode_failure)
+        self.preprocess_mode = str(preprocess_mode)
+        if self.preprocess_mode not in PREPROCESS_MODES:
+            raise ValueError(
+                f"preprocess_mode must be one of {sorted(PREPROCESS_MODES)}, "
+                f"got {self.preprocess_mode!r}"
+            )
         self.cropper = FrameCropper(
             crop_scale_factor=crop_scale_factor,
             output_size=self.input_size,
             default_radius=default_radius,
         )
         self.reader_pool = _VideoReaderPool(max_open_videos=max_open_videos)
+        self._norm_mean = torch.tensor(VMAE_MEAN, dtype=torch.float32).view(3, 1, 1, 1)
+        self._norm_std = torch.tensor(VMAE_STD, dtype=torch.float32).view(3, 1, 1, 1)
 
         # Only load the columns the dataset actually uses.  This skips
         # heavyweight columns like ``other_detections`` (JSON blobs with
@@ -371,9 +384,24 @@ class ParquetHeaderDataset(Dataset):
             return None
         return int(candidates[np.random.randint(0, len(candidates))])
 
+    def _uses_low_memory_eval(self) -> bool:
+        return getattr(self, "preprocess_mode", "torchvision") == "low_memory_eval"
+
+    def _resize_full_frame(self, frame: np.ndarray) -> np.ndarray:
+        if frame.shape[0] == self.input_size and frame.shape[1] == self.input_size:
+            return frame
+        return cv2.resize(
+            frame,
+            (self.input_size, self.input_size),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
     def _apply_spatial_policy(self, frames: list, center_det: Optional[Dict]) -> list:
-        # If the center frame has no ball, use full-frame resize via transform path.
+        # Shrink the no-ball path during inference to avoid feeding full-size
+        # frames into PIL/torchvision before we downscale them anyway.
         if center_det is None:
+            if self._uses_low_memory_eval():
+                return [self._resize_full_frame(frame) for frame in frames]
             return frames
 
         center_idx = len(frames) // 2
@@ -381,6 +409,30 @@ class ParquetHeaderDataset(Dataset):
             center_det, frames[center_idx].shape[:2]
         )
         return [self.cropper.crop(frame, center_det, radius=radius) for frame in frames]
+
+    def _to_torchvision_video(self, frames: list[np.ndarray]) -> torch.Tensor:
+        processed = []
+        for frame in frames:
+            frame_array = frame.astype("uint8", copy=False)
+            img = Image.fromarray(frame_array, "RGB")
+            if self.transform is not None:
+                tensor = self.transform(img)
+            else:
+                tensor = T.ToTensor()(img)
+            processed.append(tensor)
+        return torch.stack(processed, dim=0).permute(1, 0, 2, 3)
+
+    def _to_low_memory_video(self, frames: list[np.ndarray]) -> torch.Tensor:
+        video = torch.empty(
+            (3, len(frames), self.input_size, self.input_size),
+            dtype=torch.float32,
+        )
+        for frame_idx, frame in enumerate(frames):
+            frame_array = np.ascontiguousarray(frame.astype(np.uint8, copy=False))
+            video[:, frame_idx].copy_(torch.from_numpy(frame_array).permute(2, 0, 1))
+        video.div_(255.0)
+        video.sub_(self._norm_mean).div_(self._norm_std)
+        return video
 
     def __getitem__(self, idx: int):
         row_idx = int(idx)
@@ -406,17 +458,11 @@ class ParquetHeaderDataset(Dataset):
 
             center_det = self._build_center_detection(row_idx)
             frames = self._apply_spatial_policy(frames, center_det)
-
-            processed = []
-            for frame in frames:
-                img = Image.fromarray(frame.astype("uint8"), "RGB")
-                if self.transform is not None:
-                    tensor = self.transform(img)
-                else:
-                    tensor = T.ToTensor()(img)
-                processed.append(tensor)
-
-            video = torch.stack(processed, dim=0).permute(1, 0, 2, 3)
+            if self._uses_low_memory_eval():
+                video = self._to_low_memory_video(frames)
+            else:
+                video = self._to_torchvision_video(frames)
+            del frames
             meta = {
                 "video_id": self._video_id_at(row_idx),
                 "half": str(self.halves[row_idx]),

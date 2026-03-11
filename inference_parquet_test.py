@@ -22,7 +22,7 @@ if str(HEADER_NET_ROOT) not in sys.path:
     sys.path.insert(0, str(HEADER_NET_ROOT))
 
 from training.config import Config as TrainingConfig
-from training.data.parquet_header_dataset import ParquetHeaderDataset, _seed_worker, get_transforms
+from training.data.parquet_header_dataset import ParquetHeaderDataset, _seed_worker
 from training.models.factory import build_model
 from training.run_utils import set_seed
 
@@ -375,6 +375,7 @@ def main() -> None:
     device, gpu_ids = resolve_device_config(args.gpus, args.device)
     pin_memory = resolve_pin_memory(args.pin_memory, device)
     max_open_videos = int(args.max_open_videos)
+    preprocess_mode = "low_memory_eval"
 
     set_seed(seed)
 
@@ -389,6 +390,7 @@ def main() -> None:
     print(f"Workers:        {args.num_workers}")
     print(f"Pin memory:     {pin_memory}")
     print(f"Max open vids:  {max_open_videos}")
+    print(f"Preprocess:     {preprocess_mode}")
     print(f"Debug memory:   {args.debug_memory}")
     if gpu_ids:
         print(f"GPUs:           {gpu_ids}")
@@ -406,16 +408,16 @@ def main() -> None:
     if not subset_indices:
         raise ValueError("No parquet rows matched the requested filters.")
 
-    transform = get_transforms(input_size=input_size, is_training=False)
     base_dataset = ParquetHeaderDataset(
         parquet_path=parquet_path,
         num_frames=num_frames,
         input_size=input_size,
-        transform=transform,
+        transform=None,
         strict_paths=True,
         dataset_root=Path(args.dataset_root).expanduser(),
         max_open_videos=max_open_videos,
         resample_on_decode_failure=False,
+        preprocess_mode=preprocess_mode,
     )
     dataset = (
         Subset(base_dataset, subset_indices)
@@ -511,8 +513,6 @@ def main() -> None:
                     rows_written += 1
 
                 del inputs, logits, probs
-                if batch_idx % 50 == 0:
-                    torch.cuda.empty_cache()
                 if batch_idx % 100 == 0:
                     csv_file.flush()
 

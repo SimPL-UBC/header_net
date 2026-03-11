@@ -3,6 +3,7 @@ import sys
 
 import numpy as np
 import pytest
+import torch
 
 HEADER_NET_ROOT = Path(__file__).resolve().parents[1]
 if str(HEADER_NET_ROOT) not in sys.path:
@@ -10,6 +11,7 @@ if str(HEADER_NET_ROOT) not in sys.path:
 
 pytest.importorskip("decord")
 
+import training.data.parquet_header_dataset as parquet_dataset_module
 from training.data.parquet_header_dataset import ParquetHeaderDataset, _VideoReaderPool
 
 
@@ -41,6 +43,8 @@ def make_dataset_stub(
     frames: np.ndarray,
     resample_on_decode_failure: bool,
     max_resample_attempts: int,
+    preprocess_mode: str = "torchvision",
+    input_size: int = 4,
 ) -> ParquetHeaderDataset:
     dataset = object.__new__(ParquetHeaderDataset)
     dataset.labels = labels
@@ -48,6 +52,11 @@ def make_dataset_stub(
     dataset.frames = frames
     dataset.max_resample_attempts = max_resample_attempts
     dataset.resample_on_decode_failure = resample_on_decode_failure
+    dataset.preprocess_mode = preprocess_mode
+    dataset.input_size = input_size
+    dataset.transform = None
+    dataset._norm_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32).view(3, 1, 1, 1)
+    dataset._norm_std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32).view(3, 1, 1, 1)
     return dataset
 
 
@@ -66,6 +75,7 @@ def test_read_frames_reconstructs_duplicate_indices_from_numpy_batch(monkeypatch
     assert reader.calls == [[0, 1, 2]]
     assert len(frames) == len(requested)
     assert all(isinstance(frame, np.ndarray) for frame in frames)
+    assert all(np.shares_memory(frame, unique_batch) for frame in frames)
     np.testing.assert_array_equal(frames[0], unique_batch[2])
     np.testing.assert_array_equal(frames[1], unique_batch[2])
     np.testing.assert_array_equal(frames[2], unique_batch[0])
@@ -131,3 +141,43 @@ def test_getitem_resamples_after_decode_exception():
     assert meta["row_idx"] == 1
     assert meta["video_path"] == "good.mkv"
     assert meta["frame"] == 10
+
+
+def test_low_memory_eval_resizes_missing_ball_frames_without_pil(monkeypatch):
+    dataset = make_dataset_stub(
+        labels=np.array([0], dtype=np.int8),
+        video_paths=np.array(["video.mkv"], dtype=object),
+        frames=np.array([42], dtype=np.int64),
+        resample_on_decode_failure=False,
+        max_resample_attempts=1,
+        preprocess_mode="low_memory_eval",
+        input_size=4,
+    )
+    dataset.video_ids = np.array(["match"], dtype=object)
+    dataset.halves = np.array([1], dtype=np.int16)
+    dataset.ball_x = np.array([np.nan], dtype=np.float32)
+    dataset.ball_y = np.array([np.nan], dtype=np.float32)
+    dataset.ball_w = np.array([np.nan], dtype=np.float32)
+    dataset.ball_h = np.array([np.nan], dtype=np.float32)
+    dataset.fps = np.array([25.0], dtype=np.float32)
+    dataset.ball_confidence = np.array([np.nan], dtype=np.float32)
+
+    frames = [
+        np.full((12, 16, 3), fill_value=32, dtype=np.uint8),
+        np.full((12, 16, 3), fill_value=96, dtype=np.uint8),
+    ]
+    dataset._load_window_frames = lambda _path, _center: frames
+
+    def fail_fromarray(*_args, **_kwargs):
+        raise AssertionError("low_memory_eval should not call PIL.Image.fromarray")
+
+    monkeypatch.setattr(parquet_dataset_module.Image, "fromarray", fail_fromarray)
+
+    video, label, meta = dataset[0]
+
+    assert label == 0
+    assert tuple(video.shape) == (3, 2, 4, 4)
+    assert video.dtype == torch.float32
+    assert torch.isfinite(video).all()
+    assert meta["video_path"] == "video.mkv"
+    assert meta["frame"] == 42
