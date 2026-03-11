@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 from typing import Any
@@ -90,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=0,
+        default=4,
         help="DataLoader workers (default: %(default)s)",
     )
     parser.add_argument(
@@ -311,6 +312,7 @@ def main() -> None:
         transform=transform,
         strict_paths=True,
         dataset_root=Path(args.dataset_root).expanduser(),
+        max_open_videos=4,
         resample_on_decode_failure=False,
     )
     dataset = (
@@ -326,7 +328,7 @@ def main() -> None:
         shuffle=False,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=bool(num_workers > 0),
+        persistent_workers=False,
         prefetch_factor=1 if num_workers > 0 else None,
     )
 
@@ -344,56 +346,76 @@ def main() -> None:
 
     print(f"Evaluating {len(dataset)} samples...")
 
-    records: list[dict[str, Any]] = []
-    with torch.inference_mode():
-        for inputs, targets, meta in tqdm(loader, desc="Parquet inference", unit="batch"):
-            inputs = inputs.to(device, non_blocking=device.type == "cuda")
-            logits = model(inputs)
-            probs = F.softmax(logits, dim=1).cpu()
-
-            batch_size_actual = inputs.shape[0]
-            for item_idx in range(batch_size_actual):
-                prob_non_header = float(probs[item_idx, 0].item())
-                prob_header = float(probs[item_idx, 1].item()) if probs.shape[1] > 1 else 0.0
-                pred_label = int(prob_header >= 0.5)
-                pred_confidence = max(prob_header, prob_non_header)
-
-                records.append(
-                    {
-                        "row_idx": int(batch_item(meta["row_idx"], item_idx)),
-                        "video_id": str(batch_item(meta["video_id"], item_idx)),
-                        "half": int(batch_item(meta["half"], item_idx)),
-                        "frame": int(batch_item(meta["frame"], item_idx)),
-                        "label": int(targets[item_idx].item()),
-                        "video_path": str(batch_item(meta["video_path"], item_idx)),
-                        "fps": float(batch_item(meta["fps"], item_idx)),
-                        "ball_x": float(batch_item(meta["ball_x"], item_idx)),
-                        "ball_y": float(batch_item(meta["ball_y"], item_idx)),
-                        "ball_w": float(batch_item(meta["ball_w"], item_idx)),
-                        "ball_h": float(batch_item(meta["ball_h"], item_idx)),
-                        "ball_confidence": float(batch_item(meta["ball_confidence"], item_idx)),
-                        "prob_header": prob_header,
-                        "prob_non_header": prob_non_header,
-                        "pred_label_0p5": pred_label,
-                        "pred_confidence_0p5": pred_confidence,
-                    }
-                )
-
     output_dir.mkdir(parents=True, exist_ok=True)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
-    output_df = pd.DataFrame.from_records(records)
-    output_df.sort_values("row_idx", inplace=True)
-    output_df.to_csv(output_csv, index=False)
+    csv_fieldnames = [
+        "row_idx", "video_id", "half", "frame", "label", "video_path",
+        "fps", "ball_x", "ball_y", "ball_w", "ball_h", "ball_confidence",
+        "prob_header", "prob_non_header", "pred_label_0p5", "pred_confidence_0p5",
+    ]
+
+    rows_written = 0
+    prob_header_sum = 0.0
+    prob_header_sq_sum = 0.0
+
+    with open(output_csv, "w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
+        writer.writeheader()
+
+        with torch.inference_mode():
+            for batch_idx, (inputs, targets, meta) in enumerate(
+                tqdm(loader, desc="Parquet inference", unit="batch")
+            ):
+                inputs = inputs.to(device, non_blocking=device.type == "cuda")
+                logits = model(inputs)
+                probs = F.softmax(logits, dim=1).cpu()
+
+                batch_size_actual = inputs.shape[0]
+                for item_idx in range(batch_size_actual):
+                    prob_non_header = float(probs[item_idx, 0].item())
+                    prob_header = float(probs[item_idx, 1].item()) if probs.shape[1] > 1 else 0.0
+                    pred_label = int(prob_header >= 0.5)
+                    pred_confidence = max(prob_header, prob_non_header)
+
+                    writer.writerow(
+                        {
+                            "row_idx": int(batch_item(meta["row_idx"], item_idx)),
+                            "video_id": str(batch_item(meta["video_id"], item_idx)),
+                            "half": int(batch_item(meta["half"], item_idx)),
+                            "frame": int(batch_item(meta["frame"], item_idx)),
+                            "label": int(targets[item_idx].item()),
+                            "video_path": str(batch_item(meta["video_path"], item_idx)),
+                            "fps": float(batch_item(meta["fps"], item_idx)),
+                            "ball_x": float(batch_item(meta["ball_x"], item_idx)),
+                            "ball_y": float(batch_item(meta["ball_y"], item_idx)),
+                            "ball_w": float(batch_item(meta["ball_w"], item_idx)),
+                            "ball_h": float(batch_item(meta["ball_h"], item_idx)),
+                            "ball_confidence": float(batch_item(meta["ball_confidence"], item_idx)),
+                            "prob_header": prob_header,
+                            "prob_non_header": prob_non_header,
+                            "pred_label_0p5": pred_label,
+                            "pred_confidence_0p5": pred_confidence,
+                        }
+                    )
+                    prob_header_sum += prob_header
+                    prob_header_sq_sum += prob_header * prob_header
+                    rows_written += 1
+
+                del inputs, logits, probs
+                if batch_idx % 50 == 0:
+                    torch.cuda.empty_cache()
+                if batch_idx % 100 == 0:
+                    csv_file.flush()
 
     print("")
     print("Inference complete")
-    print(f"Rows written:   {len(output_df)}")
+    print(f"Rows written:   {rows_written}")
     print(f"Output CSV:     {output_csv}")
-    print(
-        f"Header prob:    mean={output_df['prob_header'].mean():.4f} "
-        f"std={output_df['prob_header'].std(ddof=0):.4f}"
-    )
+    if rows_written > 0:
+        mean_ph = prob_header_sum / rows_written
+        std_ph = (prob_header_sq_sum / rows_written - mean_ph ** 2) ** 0.5
+        print(f"Header prob:    mean={mean_ph:.4f} std={std_ph:.4f}")
 
 
 if __name__ == "__main__":

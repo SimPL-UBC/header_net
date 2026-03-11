@@ -82,6 +82,10 @@ def _seed_worker(worker_id: int) -> None:
     worker_seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+    # Re-initialise decord bridge in each forked worker — the module-level
+    # set_bridge() call only runs in the main process and the internal state
+    # may not survive fork.
+    decord.bridge.set_bridge("native")
 
 
 class _VideoReaderPool:
@@ -134,13 +138,9 @@ class _VideoReaderPool:
     def read_frames(self, video_path: str, frame_indices: list) -> Optional[list]:
         """Read multiple frames in one optimized batch call.
 
-        ``decord.VideoReader.get_batch()`` sorts indices internally and
-        minimises keyframe-to-target decoding overhead, making this
-        significantly faster than individual ``read_frame()`` calls.
-
         Duplicate indices (common at video boundaries due to clamping) are
-        deduplicated before the batch call and expanded back afterwards,
-        because some decord versions mishandle repeated indices.
+        deduplicated before the batch call because some decord versions
+        mishandle repeated indices.
         """
         reader = self.get(video_path)
         try:
