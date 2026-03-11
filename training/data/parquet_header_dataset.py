@@ -3,13 +3,16 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 
-import cv2
+import decord
 import numpy as np
 import pandas as pd
 import torch
 import torchvision.transforms as T
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
+
+# decord returns RGB by default when using the default bridge.
+decord.bridge.set_bridge("native")
 
 from ..config import Config
 from inference.preprocessing.frame_cropper import FrameCropper
@@ -87,28 +90,29 @@ class _VideoReaderPool:
             raise ValueError("max_open_videos must be > 0")
         self.max_open_videos = max_open_videos
         self.frame_cache_size = frame_cache_size
-        self._readers: "OrderedDict[str, cv2.VideoCapture]" = OrderedDict()
+        self._readers: "OrderedDict[str, decord.VideoReader]" = OrderedDict()
         self._meta: Dict[str, Tuple[int, int, int]] = {}
 
-    def _open(self, video_path: str) -> cv2.VideoCapture:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Unable to open video: {video_path}")
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self._meta[video_path] = (frame_count, width, height)
-        return cap
+    def _open(self, video_path: str) -> decord.VideoReader:
+        try:
+            reader = decord.VideoReader(video_path, ctx=decord.cpu())
+        except Exception as exc:
+            raise RuntimeError(f"Unable to open video: {video_path}") from exc
+        frame_count = len(reader)
+        if frame_count == 0:
+            raise RuntimeError(f"Video has no frames: {video_path}")
+        h, w, _ = reader[0].shape
+        self._meta[video_path] = (frame_count, int(w), int(h))
+        return reader
 
-    def get(self, video_path: str) -> cv2.VideoCapture:
+    def get(self, video_path: str) -> decord.VideoReader:
         reader = self._readers.get(video_path)
         if reader is not None:
             self._readers.move_to_end(video_path)
             return reader
 
         while len(self._readers) >= self.max_open_videos:
-            old_path, old_reader = self._readers.popitem(last=False)
-            old_reader.release()
+            old_path, _ = self._readers.popitem(last=False)
             self._meta.pop(old_path, None)
 
         reader = self._open(video_path)
@@ -121,16 +125,27 @@ class _VideoReaderPool:
         return self._meta[video_path]
 
     def read_frame(self, video_path: str, frame_idx: int) -> Optional[np.ndarray]:
-        cap = self.get(video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = cap.read()
-        if not ok:
+        reader = self.get(video_path)
+        try:
+            return reader[frame_idx].asnumpy()
+        except Exception:
             return None
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    def read_frames(self, video_path: str, frame_indices: list) -> Optional[list]:
+        """Read multiple frames in one optimized batch call.
+
+        ``decord.VideoReader.get_batch()`` sorts indices internally and
+        minimises keyframe-to-target decoding overhead, making this
+        significantly faster than individual ``read_frame()`` calls.
+        """
+        reader = self.get(video_path)
+        try:
+            batch = reader.get_batch(frame_indices)  # returns decord NDArray
+            return [batch[i].asnumpy() for i in range(len(frame_indices))]
+        except Exception:
+            return None
 
     def close(self) -> None:
-        for reader in self._readers.values():
-            reader.release()
         self._readers.clear()
         self._meta.clear()
 
@@ -321,13 +336,7 @@ class ParquetHeaderDataset(Dataset):
         requested = center_frame + self.window_offsets
         clamped = np.clip(requested, 0, frame_count - 1)
 
-        frames = []
-        for idx in clamped.tolist():
-            frame = self.reader_pool.read_frame(video_path, int(idx))
-            if frame is None:
-                return None
-            frames.append(frame)
-        return frames
+        return self.reader_pool.read_frames(video_path, clamped.tolist())
 
     def _sample_replacement_row(self, label: int) -> Optional[int]:
         candidates = self.positive_indices if label == 1 else self.negative_indices
