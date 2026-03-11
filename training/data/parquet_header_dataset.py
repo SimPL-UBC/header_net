@@ -41,6 +41,12 @@ _OPTIONAL_PARQUET_COLUMNS = [
 ]
 
 
+def _factorize_strings(values: pd.Series) -> tuple[np.ndarray, tuple[str, ...]]:
+    codes, uniques = pd.factorize(values.astype(str), sort=False)
+    codes = codes.astype(np.int32, copy=False)
+    return codes, tuple(str(value) for value in uniques.tolist())
+
+
 def _columns_to_load(available_columns: list[str]) -> list[str]:
     """Return the subset of *available_columns* that the dataset actually uses.
 
@@ -284,11 +290,13 @@ class ParquetHeaderDataset(Dataset):
             )
 
     def _prepare_arrays(self) -> None:
-        self.video_ids = self.df["video_id"].astype(str).to_numpy()
+        # Factorize string columns so forked DataLoader workers do not gradually
+        # copy hundreds of thousands of Python string objects into private RSS.
+        self.video_id_codes, self.video_id_table = _factorize_strings(self.df["video_id"])
         self.halves = self.df["half"].astype(np.int16).to_numpy()
         self.frames = self.df["frame"].astype(np.int64).to_numpy()
         self.labels = self.df["label"].astype(np.int8).to_numpy()
-        self.video_paths = self.df["video_path"].astype(str).to_numpy()
+        self.video_path_codes, self.video_path_table = _factorize_strings(self.df["video_path"])
         self.ball_x = pd.to_numeric(self.df["ball_x"], errors="coerce").to_numpy(np.float32)
         self.ball_y = pd.to_numeric(self.df["ball_y"], errors="coerce").to_numpy(np.float32)
         self.ball_w = pd.to_numeric(self.df["ball_w"], errors="coerce").to_numpy(np.float32)
@@ -312,7 +320,7 @@ class ParquetHeaderDataset(Dataset):
         if not self.strict_paths:
             return
 
-        unique_paths = pd.unique(self.video_paths)
+        unique_paths = self.video_path_table
         missing = [path for path in unique_paths if not Path(path).exists()]
         if missing:
             preview = ", ".join(missing[:5])
@@ -336,6 +344,16 @@ class ParquetHeaderDataset(Dataset):
             return None
 
         return {"box": [x, y, w, h]}
+
+    def _video_id_at(self, row_idx: int) -> str:
+        if hasattr(self, "video_id_codes") and hasattr(self, "video_id_table"):
+            return self.video_id_table[int(self.video_id_codes[row_idx])]
+        return str(self.video_ids[row_idx])
+
+    def _video_path_at(self, row_idx: int) -> str:
+        if hasattr(self, "video_path_codes") and hasattr(self, "video_path_table"):
+            return self.video_path_table[int(self.video_path_codes[row_idx])]
+        return str(self.video_paths[row_idx])
 
     def _load_window_frames(self, video_path: str, center_frame: int) -> list[np.ndarray]:
         frame_count, _, _ = self.reader_pool.get_meta(video_path)
@@ -369,7 +387,7 @@ class ParquetHeaderDataset(Dataset):
         target_label = int(self.labels[row_idx])
 
         for _ in range(self.max_resample_attempts):
-            video_path = self.video_paths[row_idx]
+            video_path = self._video_path_at(row_idx)
             center_frame = int(self.frames[row_idx])
 
             try:
@@ -400,7 +418,7 @@ class ParquetHeaderDataset(Dataset):
 
             video = torch.stack(processed, dim=0).permute(1, 0, 2, 3)
             meta = {
-                "video_id": str(self.video_ids[row_idx]),
+                "video_id": self._video_id_at(row_idx),
                 "half": str(self.halves[row_idx]),
                 "frame": int(center_frame),
                 "path": str(video_path),
