@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,23 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="DataLoader workers (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-open-videos",
+        type=int,
+        default=4,
+        help="Per-worker cap on simultaneously open video readers (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="DataLoader pinned-memory mode: auto uses CUDA-only pinning (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--debug-memory",
+        action="store_true",
+        help="Log main/worker RSS during inference for diagnosing host RAM usage",
     )
     parser.add_argument(
         "--gpus",
@@ -242,6 +260,83 @@ def resolve_device_config(
     return device, []
 
 
+def resolve_pin_memory(pin_memory_arg: str, device: torch.device) -> bool:
+    if pin_memory_arg == "on":
+        return True
+    if pin_memory_arg == "off":
+        return False
+    return device.type == "cuda"
+
+
+def _read_kib_fields(pid: int) -> dict[str, int]:
+    fields: dict[str, int] = {}
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith(("VmRSS:", "VmHWM:", "VmSize:")):
+                    key, value = line.split(":", 1)
+                    fields[key] = int(value.strip().split()[0])
+    except FileNotFoundError:
+        return {}
+    return fields
+
+
+def _read_direct_children(pid: int) -> list[int]:
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children", "r", encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except FileNotFoundError:
+        return []
+    if not text:
+        return []
+    return [int(value) for value in text.split()]
+
+
+def _read_mem_available_kib() -> tuple[int, int]:
+    total_kib = 0
+    available_kib = 0
+    with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("MemTotal:"):
+                total_kib = int(line.split()[1])
+            elif line.startswith("MemAvailable:"):
+                available_kib = int(line.split()[1])
+            if total_kib and available_kib:
+                break
+    return total_kib, available_kib
+
+
+def _format_gib(kib: int) -> str:
+    return f"{kib / 1024 / 1024:.2f} GiB"
+
+
+def log_memory_snapshot(root_pid: int, *, batch_idx: int | None = None) -> None:
+    main_fields = _read_kib_fields(root_pid)
+    child_rows = []
+    for child_pid in _read_direct_children(root_pid):
+        fields = _read_kib_fields(child_pid)
+        if not fields:
+            continue
+        child_rows.append((child_pid, fields.get("VmRSS", 0)))
+    child_rows.sort(key=lambda row: row[1], reverse=True)
+
+    total_kib, available_kib = _read_mem_available_kib()
+    used_kib = max(total_kib - available_kib, 0)
+    prefix = "[memory]" if batch_idx is None else f"[memory] batch={batch_idx}"
+    main_rss = main_fields.get("VmRSS", 0)
+    child_rss = sum(rss for _, rss in child_rows)
+    print(
+        f"{prefix} main_pid={root_pid} main_rss={_format_gib(main_rss)} "
+        f"children={len(child_rows)} children_rss={_format_gib(child_rss)} "
+        f"system_used={_format_gib(used_kib)}/{_format_gib(total_kib)}"
+    )
+    if child_rows:
+        top_children = ", ".join(
+            f"{pid}:{_format_gib(rss)}" for pid, rss in child_rows[:8]
+        )
+        print(f"{prefix} child_rss {top_children}")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -278,6 +373,8 @@ def main() -> None:
     seed = int(resolve_from_checkpoint(args.seed, checkpoint_config, "seed", 42))
     backbone_ckpt = resolve_backbone_ckpt(args.backbone_ckpt, checkpoint_config)
     device, gpu_ids = resolve_device_config(args.gpus, args.device)
+    pin_memory = resolve_pin_memory(args.pin_memory, device)
+    max_open_videos = int(args.max_open_videos)
 
     set_seed(seed)
 
@@ -289,6 +386,10 @@ def main() -> None:
     print(f"Num frames:     {num_frames}")
     print(f"Input size:     {input_size}")
     print(f"Batch size:     {batch_size}")
+    print(f"Workers:        {args.num_workers}")
+    print(f"Pin memory:     {pin_memory}")
+    print(f"Max open vids:  {max_open_videos}")
+    print(f"Debug memory:   {args.debug_memory}")
     if gpu_ids:
         print(f"GPUs:           {gpu_ids}")
     print(f"Device:         {device}")
@@ -301,6 +402,7 @@ def main() -> None:
         mask &= filter_df["half"].astype(int) == int(args.half)
 
     subset_indices = filter_df.index[mask].tolist()
+    del filter_df
     if not subset_indices:
         raise ValueError("No parquet rows matched the requested filters.")
 
@@ -312,7 +414,7 @@ def main() -> None:
         transform=transform,
         strict_paths=True,
         dataset_root=Path(args.dataset_root).expanduser(),
-        max_open_videos=4,
+        max_open_videos=max_open_videos,
         resample_on_decode_failure=False,
     )
     dataset = (
@@ -327,7 +429,7 @@ def main() -> None:
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=device.type == "cuda",
+        pin_memory=pin_memory,
         persistent_workers=False,
         prefetch_factor=1 if num_workers > 0 else None,
         worker_init_fn=_seed_worker,
@@ -340,12 +442,15 @@ def main() -> None:
         input_size=input_size,
         backbone_ckpt=backbone_ckpt,
     )
+    del checkpoint_payload
     model = model.to(device)
     if len(gpu_ids) > 1:
         model = torch.nn.DataParallel(model, device_ids=gpu_ids)
     model.eval()
 
     print(f"Evaluating {len(dataset)} samples...")
+    if args.debug_memory:
+        log_memory_snapshot(os.getpid())
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -371,6 +476,8 @@ def main() -> None:
                 inputs = inputs.to(device, non_blocking=device.type == "cuda")
                 logits = model(inputs)
                 probs = F.softmax(logits, dim=1).cpu()
+                if args.debug_memory and (batch_idx == 0 or batch_idx % 10 == 0):
+                    log_memory_snapshot(os.getpid(), batch_idx=batch_idx)
 
                 batch_size_actual = inputs.shape[0]
                 for item_idx in range(batch_size_actual):

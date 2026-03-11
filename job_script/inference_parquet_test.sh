@@ -39,6 +39,9 @@ INPUT_SIZE="${INPUT_SIZE:-}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 # decord is required: pip install decord>=0.6.0
 NUM_WORKERS="${NUM_WORKERS:-6}"
+MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-4}"
+PIN_MEMORY="${PIN_MEMORY:-auto}"
+DEBUG_MEMORY="${DEBUG_MEMORY:-0}"
 GPUS="${GPUS:-0 1}"
 DEVICE="${DEVICE:-}"
 SEED="${SEED:-}"
@@ -64,6 +67,8 @@ ARGS=(
 	--dataset-root "${DATASET_ROOT}"
 	--batch-size "${BATCH_SIZE}"
 	--num-workers "${NUM_WORKERS}"
+	--max-open-videos "${MAX_OPEN_VIDEOS}"
+	--pin-memory "${PIN_MEMORY}"
 )
 
 if [[ -n "${OUTPUT_CSV}" ]]; then
@@ -94,6 +99,11 @@ fi
 if [[ -n "${SEED}" ]]; then
 	ARGS+=(--seed "${SEED}")
 fi
+case "${DEBUG_MEMORY}" in
+	1|true|TRUE|on|ON|yes|YES)
+		ARGS+=(--debug-memory)
+		;;
+esac
 
 "${PYTHON_BIN}" "${ARGS[@]}"
 
