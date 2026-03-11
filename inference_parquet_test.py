@@ -21,7 +21,7 @@ if str(HEADER_NET_ROOT) not in sys.path:
     sys.path.insert(0, str(HEADER_NET_ROOT))
 
 from training.config import Config as TrainingConfig
-from training.data.parquet_header_dataset import ParquetHeaderDataset, get_transforms
+from training.data.parquet_header_dataset import ParquetHeaderDataset, _seed_worker, get_transforms
 from training.models.factory import build_model
 from training.run_utils import set_seed
 
@@ -330,6 +330,7 @@ def main() -> None:
         pin_memory=device.type == "cuda",
         persistent_workers=False,
         prefetch_factor=1 if num_workers > 0 else None,
+        worker_init_fn=_seed_worker,
     )
 
     model = build_model_from_checkpoint(
