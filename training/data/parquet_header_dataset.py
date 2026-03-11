@@ -137,11 +137,16 @@ class _VideoReaderPool:
         ``decord.VideoReader.get_batch()`` sorts indices internally and
         minimises keyframe-to-target decoding overhead, making this
         significantly faster than individual ``read_frame()`` calls.
+
+        Duplicate indices (common at video boundaries due to clamping) are
+        deduplicated before the batch call and expanded back afterwards,
+        because some decord versions mishandle repeated indices.
         """
         reader = self.get(video_path)
         try:
-            batch = reader.get_batch(frame_indices)  # returns decord NDArray
-            return [batch[i].asnumpy() for i in range(len(frame_indices))]
+            unique_indices, inverse = np.unique(frame_indices, return_inverse=True)
+            batch = reader.get_batch(unique_indices.tolist())
+            return [batch[inverse[i]].asnumpy() for i in range(len(frame_indices))]
         except Exception:
             return None
 
