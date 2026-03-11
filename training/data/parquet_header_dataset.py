@@ -135,20 +135,24 @@ class _VideoReaderPool:
         except Exception:
             return None
 
-    def read_frames(self, video_path: str, frame_indices: list) -> Optional[list]:
+    def read_frames(self, video_path: str, frame_indices: list[int]) -> list[np.ndarray]:
         """Read multiple frames in one optimized batch call.
 
         Duplicate indices (common at video boundaries due to clamping) are
         deduplicated before the batch call because some decord versions
         mishandle repeated indices.
         """
+        if len(frame_indices) == 0:
+            return []
+
         reader = self.get(video_path)
-        try:
-            unique_indices, inverse = np.unique(frame_indices, return_inverse=True)
-            batch = reader.get_batch(unique_indices.tolist())
-            return [batch[inverse[i]].asnumpy() for i in range(len(frame_indices))]
-        except Exception:
-            return None
+        unique_indices, inverse = np.unique(
+            np.asarray(frame_indices, dtype=np.int64), return_inverse=True
+        )
+        # decord 0.6.0 returns an NDArray that supports asnumpy() but not direct
+        # Python indexing, so convert once before reconstructing duplicate indices.
+        batch = reader.get_batch(unique_indices.tolist()).asnumpy()
+        return [frame for frame in batch[inverse]]
 
     def close(self) -> None:
         self._readers.clear()
@@ -333,7 +337,7 @@ class ParquetHeaderDataset(Dataset):
 
         return {"box": [x, y, w, h]}
 
-    def _load_window_frames(self, video_path: str, center_frame: int) -> Optional[list]:
+    def _load_window_frames(self, video_path: str, center_frame: int) -> list[np.ndarray]:
         frame_count, _, _ = self.reader_pool.get_meta(video_path)
         if frame_count <= 0:
             raise RuntimeError(f"Video has no frames: {video_path}")
@@ -368,13 +372,14 @@ class ParquetHeaderDataset(Dataset):
             video_path = self.video_paths[row_idx]
             center_frame = int(self.frames[row_idx])
 
-            frames = self._load_window_frames(video_path, center_frame)
-            if frames is None:
+            try:
+                frames = self._load_window_frames(video_path, center_frame)
+            except Exception as exc:
                 if not self.resample_on_decode_failure:
                     raise RuntimeError(
                         "Unable to decode temporal window for "
                         f"row_idx={row_idx} video={video_path} frame={center_frame}"
-                    )
+                    ) from exc
                 replacement = self._sample_replacement_row(target_label)
                 if replacement is None:
                     break
