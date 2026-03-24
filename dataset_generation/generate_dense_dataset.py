@@ -100,7 +100,8 @@ class SoccerNetInference:
             variant="large",
             weights_path=str(weights_path),
             device=device,
-            target_class_ids=(0, 1, 2, 3),
+            # Dense parquet generation only needs ball detections.
+            target_class_ids=(0,),
             optimize=optimize,
             optimize_batch_size=optimize_batch_size,
             optimize_compile=optimize_compile,
