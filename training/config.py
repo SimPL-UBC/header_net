@@ -12,6 +12,10 @@ class Config:
     val_parquet: str = ""
     dataset_root: str = ""
     neg_pos_ratio: str = "all"
+    train_video_ids: List[str] = field(default_factory=list)
+    train_halves: List[int] = field(default_factory=list)
+    val_video_ids: List[str] = field(default_factory=list)
+    val_halves: List[int] = field(default_factory=list)
     num_frames: int = 16  # Default to current cache value
     input_size: int = 224
     frame_sampling: str = "center"  # Phase 1: only "center" supported
@@ -33,6 +37,9 @@ class Config:
     batch_size: int = 16
     num_workers: int = 8
     val_num_workers: int = 0
+    max_open_videos: int = 8
+    frame_cache_size: int = 128
+    loader_start_method: str = "spawn"
 
     # Loss
     loss_type: str = "focal"
@@ -75,6 +82,14 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.dataset_root = args.dataset_root
     if hasattr(args, "neg_pos_ratio"):
         config.neg_pos_ratio = str(args.neg_pos_ratio)
+    if hasattr(args, "train_video_ids") and args.train_video_ids is not None:
+        config.train_video_ids = [str(value) for value in args.train_video_ids]
+    if hasattr(args, "train_halves") and args.train_halves is not None:
+        config.train_halves = [int(value) for value in args.train_halves]
+    if hasattr(args, "val_video_ids") and args.val_video_ids is not None:
+        config.val_video_ids = [str(value) for value in args.val_video_ids]
+    if hasattr(args, "val_halves") and args.val_halves is not None:
+        config.val_halves = [int(value) for value in args.val_halves]
 
     # Model
     if hasattr(args, "backbone"):
@@ -107,6 +122,12 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.num_workers = args.num_workers
     if hasattr(args, "val_num_workers"):
         config.val_num_workers = args.val_num_workers
+    if hasattr(args, "max_open_videos"):
+        config.max_open_videos = args.max_open_videos
+    if hasattr(args, "frame_cache_size"):
+        config.frame_cache_size = args.frame_cache_size
+    if hasattr(args, "loader_start_method"):
+        config.loader_start_method = args.loader_start_method
 
     # Run
     if hasattr(args, "run_name"):

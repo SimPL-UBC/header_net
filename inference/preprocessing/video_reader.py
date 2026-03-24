@@ -3,18 +3,19 @@
 from pathlib import Path
 from typing import Optional, Dict, Iterator, Tuple
 from collections import OrderedDict
-import cv2
+import decord
 import numpy as np
+
+decord.bridge.set_bridge("native")
 
 
 class VideoReader:
     """
     Efficient video frame reader with optional caching.
 
-    This class wraps OpenCV's VideoCapture with additional features:
+    This class wraps decord's VideoReader with additional features:
     - Random access frame seeking
     - Optional LRU frame caching for repeated access
-    - Automatic BGR to RGB conversion
     - Context manager support
 
     Attributes:
@@ -48,18 +49,27 @@ class VideoReader:
         self.cache_frames = cache_frames
         self.max_cache_size = max_cache_size
 
-        self._cap = cv2.VideoCapture(str(video_path))
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Unable to open video: {video_path}")
+        try:
+            self._reader = decord.VideoReader(str(video_path), ctx=decord.cpu())
+        except Exception as exc:
+            raise RuntimeError(f"Unable to open video: {video_path}") from exc
 
-        self.frame_count = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.fps = self._cap.get(cv2.CAP_PROP_FPS)
+        self.frame_count = int(len(self._reader))
+        if self.frame_count <= 0:
+            raise RuntimeError(f"Video has no frames: {video_path}")
+
+        first_frame = self._reader.get_batch([0]).asnumpy()[0]
+        self.height = int(first_frame.shape[0])
+        self.width = int(first_frame.shape[1])
+        try:
+            self.fps = float(self._reader.get_avg_fps())
+        except Exception:
+            self.fps = 0.0
 
         # LRU cache using OrderedDict
         self._frame_cache: OrderedDict[int, np.ndarray] = OrderedDict()
-        self._current_pos = 0
+        if self.cache_frames:
+            self._frame_cache[0] = np.ascontiguousarray(first_frame)
 
     def get_frame(self, frame_idx: int) -> Optional[np.ndarray]:
         """
@@ -80,19 +90,11 @@ class VideoReader:
             self._frame_cache.move_to_end(frame_idx)
             return self._frame_cache[frame_idx]
 
-        # Seek if needed
-        if frame_idx != self._current_pos:
-            self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            self._current_pos = frame_idx
-
-        ret, frame = self._cap.read()
-        if not ret:
+        try:
+            frame_rgb = self._reader[int(frame_idx)].asnumpy()
+        except Exception:
             return None
-
-        self._current_pos += 1
-
-        # Convert BGR to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_rgb = np.ascontiguousarray(frame_rgb)
 
         # Add to cache if enabled
         if self.cache_frames:
@@ -152,9 +154,8 @@ class VideoReader:
 
     def release(self):
         """Release the video capture object."""
-        if hasattr(self, "_cap") and self._cap is not None:
-            self._cap.release()
-            self._cap = None
+        if hasattr(self, "_reader"):
+            self._reader = None
 
     def __enter__(self):
         return self

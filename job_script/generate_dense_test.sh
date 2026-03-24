@@ -16,6 +16,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # WEIGHTS_PATH: path to SoccerNet RF-DETR weights
 # CONF_THRESHOLD: detection confidence threshold (default: 0.25)
 # BATCH_SIZE: inference batch size (default: 8)
+# DECODE_CHUNK_SIZE: decord decode chunk size (default: 256)
 # TOPK: max detections per frame (default: 15)
 # DEVICE: torch device override (cpu/cuda/mps; auto if empty)
 # OPTIMIZE: 1 to enable RF-DETR optimization (default: 1)
@@ -52,10 +53,11 @@ fi
 
 DATASET_PATH="${DATASET_PATH:-${REPO_ROOT}/SoccerNet/test}"
 LABELS_DIR="${LABELS_DIR:-${REPO_ROOT}/SoccerNet/test/labelled_header}"
-OUTPUT_BASE="${OUTPUT_BASE:-${REPO_ROOT}/output/dense_dataset_test/}"
+OUTPUT_BASE="${OUTPUT_BASE:-${REPO_ROOT}/output/dense_dataset}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${REPO_ROOT}/RFDETR-Soccernet/weights/checkpoint_best_regular.pth}"
 CONF_THRESHOLD="${CONF_THRESHOLD:-0.25}"
 BATCH_SIZE="${BATCH_SIZE:-96}"
+DECODE_CHUNK_SIZE="${DECODE_CHUNK_SIZE:-256}"
 TOPK="${TOPK:-15}"
 MODEL_NUM_FRAMES="${MODEL_NUM_FRAMES:-16}"
 CONTINUOUS_OFFSETS_25FPS="${CONTINUOUS_OFFSETS_25FPS:--1 0 1 2 3}"
@@ -71,7 +73,7 @@ OPTIMIZE_BATCH_SIZE="${OPTIMIZE_BATCH_SIZE:-1}"
 OPTIMIZE_COMPILE="${OPTIMIZE_COMPILE:-0}"
 LABEL_MODE="${LABEL_MODE:-continuous}"
 
-OUTPUT_PATH="${OUTPUT_BASE}/dense_test.parquet"
+OUTPUT_PATH="${OUTPUT_BASE}/dense_test"
 FAILED_LOG_PATH="${OUTPUT_BASE}/dense_test_failed_videos.csv"
 FAILED_FRAME_LOG_PATH="${OUTPUT_BASE}/dense_test_failed_frames.csv"
 
@@ -204,6 +206,7 @@ ARGS=(
 	--weights "${WEIGHTS_PATH}"
 	--confidence-threshold "${CONF_THRESHOLD}"
 	--batch-size "${BATCH_SIZE}"
+	--decode-chunk-size "${DECODE_CHUNK_SIZE}"
 	--topk "${TOPK}"
 	--model-num-frames "${MODEL_NUM_FRAMES}"
 	--min-decode-ratio "${MIN_DECODE_RATIO}"

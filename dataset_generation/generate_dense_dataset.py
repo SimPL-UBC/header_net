@@ -3,8 +3,9 @@
 
 Unlike the sparse pipeline (``generate_positive_negative_dataset.py``), this script
 processes **every** frame of every video, runs RF-DETR detection, applies Kalman
-smoothing to ball trajectories, and writes a single compact Parquet file.  No ``.npy``
-clips are cached — the training dataloader reads video on-the-fly using this metadata.
+smoothing to ball trajectories, and writes either a single Parquet file or a
+partitioned Parquet dataset directory. No ``.npy`` clips are cached — the training
+dataloader reads video on-the-fly using this metadata.
 
 Two labeling modes are supported (mutually exclusive):
   --one-frame-header        Only annotated frames get label=1
@@ -29,18 +30,23 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import cv2
+import decord
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 try:
-    import pyarrow  # noqa: F401 — needed by pandas Parquet engine
+    import pyarrow as pa
+    import pyarrow.dataset as pads
+    import pyarrow.parquet as pq
 except ImportError:
     print(
         "[ERROR] pyarrow is required for Parquet output. "
         "Install with: pip install pyarrow"
     )
     sys.exit(1)
+
+decord.bridge.set_bridge("native")
 
 HEADER_NET_ROOT = Path(__file__).resolve().parents[1]
 if str(HEADER_NET_ROOT) not in sys.path:
@@ -144,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-path",
         required=True,
-        help="Full path for output .parquet file",
+        help="Output parquet file path or partitioned dataset directory",
     )
     parser.add_argument(
         "--failed-log-path",
@@ -215,6 +221,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=15,
         help="Maximum detections to keep per frame",
+    )
+    parser.add_argument(
+        "--decode-chunk-size",
+        type=int,
+        default=256,
+        help="Number of contiguous frames to decode per decord batch",
     )
     parser.add_argument(
         "--min-decode-ratio",
@@ -351,6 +363,11 @@ def detect_decode_error_with_ffmpeg(
         "error",
         "-i",
         str(video_path),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
         "-f",
         "null",
         "-",
@@ -441,6 +458,7 @@ def run_dense_detection(
     source: VideoSource,
     model: SoccerNetInference,
     batch_size: int,
+    decode_chunk_size: int,
     score_threshold: float,
     topk: int,
 ) -> Tuple[Dict[int, List[Dict[str, float]]], int, int]:
@@ -448,36 +466,50 @@ def run_dense_detection(
 
     Returns ``(raw_detections, total_frames, decoded_frames)``.
     """
-    cap = cv2.VideoCapture(str(source.path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Unable to open video {source.path}")
+    if decode_chunk_size < 1:
+        raise ValueError("decode_chunk_size must be >= 1")
 
-    total_frames = source.frame_count
+    try:
+        reader = decord.VideoReader(str(source.path), ctx=decord.cpu())
+    except Exception as exc:
+        raise RuntimeError(f"Unable to open video {source.path}") from exc
+
+    total_frames = len(reader)
     raw: Dict[int, List[Dict[str, float]]] = {}
     decoded = 0
 
     batch_frames: List[np.ndarray] = []
     batch_indices: List[int] = []
-    frame_id = 0
+    for start_idx in range(0, total_frames, decode_chunk_size):
+        stop_idx = min(total_frames, start_idx + decode_chunk_size)
+        chunk_indices = list(range(start_idx, stop_idx))
+        decoded_frames: list[tuple[int, np.ndarray]] = []
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        try:
+            chunk = reader.get_batch(chunk_indices).asnumpy()
+            decoded_frames = [
+                (frame_idx, np.ascontiguousarray(chunk[offset]))
+                for offset, frame_idx in enumerate(chunk_indices)
+            ]
+        except Exception:
+            for frame_idx in chunk_indices:
+                try:
+                    frame = reader[frame_idx].asnumpy()
+                except Exception:
+                    continue
+                decoded_frames.append((frame_idx, np.ascontiguousarray(frame)))
 
-        decoded += 1
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        batch_frames.append(rgb)
-        batch_indices.append(frame_id)
+        decoded += len(decoded_frames)
+        for frame_idx, rgb in decoded_frames:
+            batch_frames.append(rgb)
+            batch_indices.append(frame_idx)
 
-        if len(batch_frames) >= batch_size:
-            preds = model(batch_frames, score_threshold=score_threshold, topk=topk)
-            for fid, dets in zip(batch_indices, preds):
-                raw[fid] = dets
-            batch_frames.clear()
-            batch_indices.clear()
-
-        frame_id += 1
+            if len(batch_frames) >= batch_size:
+                preds = model(batch_frames, score_threshold=score_threshold, topk=topk)
+                for fid, dets in zip(batch_indices, preds):
+                    raw[fid] = dets
+                batch_frames.clear()
+                batch_indices.clear()
 
     # Flush remaining batch
     if batch_frames:
@@ -485,8 +517,51 @@ def run_dense_detection(
         for fid, dets in zip(batch_indices, preds):
             raw[fid] = dets
 
-    cap.release()
     return raw, total_frames, decoded
+
+
+def _cast_record_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["half"] = df["half"].astype("int8")
+    df["frame"] = df["frame"].astype("int32")
+    df["label"] = df["label"].astype("int8")
+    df["fps"] = df["fps"].astype("float32")
+    df["frame_stride"] = df["frame_stride"].astype("int8")
+    df["frame_width"] = df["frame_width"].astype("int16")
+    df["frame_height"] = df["frame_height"].astype("int16")
+    df["num_players"] = df["num_players"].astype("int16")
+    df["num_referees"] = df["num_referees"].astype("int16")
+    df["num_goalkeepers"] = df["num_goalkeepers"].astype("int16")
+    for col in ["ball_x", "ball_y", "ball_w", "ball_h", "ball_confidence", "ball_vx", "ball_vy"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+    return df
+
+
+def _build_output_metadata(args: argparse.Namespace, label_mode: str) -> Dict[bytes, bytes]:
+    return {
+        b"generator": b"generate_dense_dataset.py",
+        b"label_mode": label_mode.encode(),
+        b"continuous_offsets_25fps": json.dumps(args.continuous_offsets_25fps).encode(),
+        b"continuous_offsets_50fps": json.dumps(args.continuous_offsets_50fps).encode(),
+        b"model_num_frames": str(args.model_num_frames).encode(),
+        b"confidence_threshold": str(args.confidence_threshold).encode(),
+        b"creation_date": datetime.now().isoformat().encode(),
+    }
+
+
+def _table_from_dataframe(df: pd.DataFrame, metadata: Dict[bytes, bytes]) -> pa.Table:
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    schema_metadata = dict(table.schema.metadata or {})
+    schema_metadata.update(metadata)
+    return table.replace_schema_metadata(schema_metadata)
+
+
+def _directory_size_bytes(path: Path) -> int:
+    total = 0
+    for file_path in path.rglob("*"):
+        if file_path.is_file():
+            total += file_path.stat().st_size
+    return total
 
 
 def _build_model_window_offsets(num_frames: int) -> np.ndarray:
@@ -621,6 +696,8 @@ def main() -> None:
 
     if args.batch_size < 1:
         raise ValueError("batch-size must be >= 1")
+    if args.decode_chunk_size < 1:
+        raise ValueError("decode-chunk-size must be >= 1")
     if not 0.0 <= args.min_decode_ratio <= 1.0:
         raise ValueError("--min-decode-ratio must be in [0.0, 1.0]")
     if args.model_num_frames <= 0:
@@ -631,8 +708,11 @@ def main() -> None:
         )
 
     output_path = Path(args.output_path)
-    if not str(output_path).lower().endswith(".parquet"):
-        raise ValueError("--output-path must end with .parquet")
+    output_is_file = output_path.suffix.lower() == ".parquet"
+    if output_path.exists() and output_is_file and output_path.is_dir():
+        raise ValueError(f"Output path is a directory but ends with .parquet: {output_path}")
+    if output_path.exists() and not output_is_file and output_path.is_file():
+        raise ValueError(f"Output dataset path is a file, expected directory: {output_path}")
     failed_log_path = (
         Path(args.failed_log_path)
         if args.failed_log_path
@@ -714,6 +794,12 @@ def main() -> None:
     total_frames_processed = 0
     total_rows_dropped_window = 0
     t_start = time.perf_counter()
+    output_metadata = _build_output_metadata(args, label_mode)
+    written_row_count = 0
+    written_chunk_count = 0
+
+    if not output_is_file:
+        output_path.mkdir(parents=True, exist_ok=True)
 
     for key, source in tqdm(sources.items(), desc="Processing videos"):
         fps = fps_map[key]
@@ -752,6 +838,7 @@ def main() -> None:
                 source,
                 inference,
                 batch_size=args.batch_size,
+                decode_chunk_size=args.decode_chunk_size,
                 score_threshold=args.confidence_threshold,
                 topk=args.topk,
             )
@@ -842,8 +929,22 @@ def main() -> None:
             )
 
         if records:
-            chunk_df = pd.DataFrame(records)
-            all_chunks.append(chunk_df)
+            chunk_df = _cast_record_dataframe(pd.DataFrame(records))
+            written_row_count += len(chunk_df)
+            if output_is_file:
+                all_chunks.append(chunk_df)
+            else:
+                written_chunk_count += 1
+                chunk_table = _table_from_dataframe(chunk_df, output_metadata)
+                pads.write_dataset(
+                    chunk_table,
+                    base_dir=str(output_path),
+                    format="parquet",
+                    partitioning=["video_id", "half"],
+                    partitioning_flavor="hive",
+                    existing_data_behavior="overwrite_or_ignore",
+                    basename_template=f"part-{written_chunk_count:05d}-{{i}}.parquet",
+                )
         else:
             elapsed = time.perf_counter() - t_video
             failed_records.append(
@@ -872,47 +973,20 @@ def main() -> None:
         )
 
     # ── Step 7: Write Parquet ──
-    if not all_chunks:
+    if output_is_file and not all_chunks:
+        raise SystemExit("[ERROR] No data to write — all videos failed.")
+    if not output_is_file and written_row_count == 0:
         raise SystemExit("[ERROR] No data to write — all videos failed.")
 
-    df = pd.concat(all_chunks, ignore_index=True)
-
-    # Cast to efficient types
-    df["half"] = df["half"].astype("int8")
-    df["frame"] = df["frame"].astype("int32")
-    df["label"] = df["label"].astype("int8")
-    df["fps"] = df["fps"].astype("float32")
-    df["frame_stride"] = df["frame_stride"].astype("int8")
-    df["frame_width"] = df["frame_width"].astype("int16")
-    df["frame_height"] = df["frame_height"].astype("int16")
-    df["num_players"] = df["num_players"].astype("int16")
-    df["num_referees"] = df["num_referees"].astype("int16")
-    df["num_goalkeepers"] = df["num_goalkeepers"].astype("int16")
-
-    for col in ["ball_x", "ball_y", "ball_w", "ball_h", "ball_confidence", "ball_vx", "ball_vy"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Attach file-level metadata via pyarrow
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    table = pa.Table.from_pandas(df)
-    metadata = table.schema.metadata or {}
-    metadata.update(
-        {
-            b"generator": b"generate_dense_dataset.py",
-            b"label_mode": label_mode.encode(),
-            b"continuous_offsets_25fps": json.dumps(args.continuous_offsets_25fps).encode(),
-            b"continuous_offsets_50fps": json.dumps(args.continuous_offsets_50fps).encode(),
-            b"model_num_frames": str(args.model_num_frames).encode(),
-            b"confidence_threshold": str(args.confidence_threshold).encode(),
-            b"creation_date": datetime.now().isoformat().encode(),
-        }
-    )
-    table = table.replace_schema_metadata(metadata)
-    pq.write_table(table, str(output_path), compression="snappy")
+    if output_is_file:
+        df = pd.concat(all_chunks, ignore_index=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        table = _table_from_dataframe(df, output_metadata)
+        pq.write_table(table, str(output_path), compression="snappy")
+    else:
+        df = pads.dataset(str(output_path), format="parquet", partitioning="hive").to_table(
+            columns=["label", "fps", "frame_stride"]
+        ).to_pandas()
 
     total_time = time.perf_counter() - t_start
 
@@ -937,9 +1011,35 @@ def main() -> None:
     elif failed_frame_log_path.exists():
         failed_frame_log_path.unlink()
 
+    manifest_path = (
+        output_path.parent / f"{output_path.name}_manifest.json"
+        if not output_is_file
+        else output_path.parent / f"{output_path.stem}_manifest.json"
+    )
+    manifest_payload = {
+        "output_path": str(output_path),
+        "output_mode": "single_file" if output_is_file else "partitioned_dataset",
+        "label_mode": label_mode,
+        "continuous_offsets_25fps": list(args.continuous_offsets_25fps),
+        "continuous_offsets_50fps": list(args.continuous_offsets_50fps),
+        "model_num_frames": int(args.model_num_frames),
+        "confidence_threshold": float(args.confidence_threshold),
+        "decode_chunk_size": int(args.decode_chunk_size),
+        "batch_size": int(args.batch_size),
+        "videos_indexed": len(sources),
+        "videos_failed": len(failed_records),
+        "rows_written": int(len(df) if output_is_file else written_row_count),
+        "creation_date": datetime.now().isoformat(),
+    }
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        json.dump(manifest_payload, handle, indent=2)
+
     # ── Step 9: Summary ──
     ball_rate = total_ball_detected / total_frames_processed * 100 if total_frames_processed else 0
     label_dist = df["label"].value_counts().to_dict()
+    output_size_bytes = (
+        output_path.stat().st_size if output_is_file else _directory_size_bytes(output_path)
+    )
 
     print("\n" + "=" * 60)
     print("DENSE DATASET GENERATION SUMMARY")
@@ -956,7 +1056,11 @@ def main() -> None:
     print(f"  Label=1:          {label_dist.get(1, 0):,}")
     print(f"  FPS values:       {sorted(df['fps'].unique())}")
     print(f"  Stride values:    {sorted(df['frame_stride'].unique())}")
-    print(f"  Parquet size:     {output_path.stat().st_size / 1024 / 1024:.1f} MB")
+    print(
+        f"  Output mode:      {'single_file' if output_is_file else 'partitioned_dataset'}"
+    )
+    print(f"  Parquet size:     {output_size_bytes / 1024 / 1024:.1f} MB")
+    print(f"  Manifest:         {manifest_path}")
     print(f"  Total time:       {total_time:.1f}s")
     print("=" * 60)
 

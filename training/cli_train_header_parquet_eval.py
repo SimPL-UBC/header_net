@@ -19,7 +19,11 @@ def parse_args():
         description="Evaluate Header Net parquet checkpoint on validation parquet."
     )
     parser.add_argument("--checkpoint_path", required=True, help="Path to checkpoint .pt")
-    parser.add_argument("--val_parquet", required=True, help="Path to val parquet")
+    parser.add_argument(
+        "--val_parquet",
+        required=True,
+        help="Path to val parquet file or partitioned parquet dataset directory",
+    )
     parser.add_argument(
         "--dataset_root",
         default="SoccerNet",
@@ -29,6 +33,17 @@ def parse_args():
         "--output_dir",
         default=None,
         help="Output directory for metrics/predictions (default: checkpoint run directory)",
+    )
+    parser.add_argument(
+        "--video_id",
+        default=None,
+        help="Optional validation video_id filter",
+    )
+    parser.add_argument(
+        "--half",
+        type=int,
+        default=None,
+        help="Optional validation half filter",
     )
 
     parser.add_argument(
@@ -60,6 +75,24 @@ def parse_args():
         type=int,
         default=1000,
         help="Print progress every N validation batches",
+    )
+    parser.add_argument(
+        "--max_open_videos",
+        type=int,
+        default=8,
+        help="Per-worker cap on open decord readers",
+    )
+    parser.add_argument(
+        "--frame_cache_size",
+        type=int,
+        default=128,
+        help="Per-worker frame cache size (frames)",
+    )
+    parser.add_argument(
+        "--loader_start_method",
+        choices=("spawn", "fork", "forkserver"),
+        default="spawn",
+        help="Multiprocessing start method for validation workers",
     )
     parser.add_argument(
         "--val_neg_pos_ratio",
@@ -301,6 +334,10 @@ def main():
     config.val_parquet = args.val_parquet
     config.dataset_root = args.dataset_root
     config.neg_pos_ratio = "all"
+    config.train_video_ids = []
+    config.train_halves = []
+    config.val_video_ids = [str(args.video_id)] if args.video_id else []
+    config.val_halves = [int(args.half)] if args.half is not None else []
     config.num_frames = int(_resolve(args.num_frames, checkpoint_config, "num_frames", 16))
     config.input_size = int(_resolve(None, checkpoint_config, "input_size", 224))
     config.backbone = str(_resolve(args.backbone, checkpoint_config, "backbone", "vmae"))
@@ -331,6 +368,9 @@ def main():
     config.val_num_workers = int(args.val_num_workers)
     config.val_pin_memory = bool(args.val_pin_memory)
     config.val_progress_every = int(args.val_progress_every)
+    config.max_open_videos = int(args.max_open_videos)
+    config.frame_cache_size = int(args.frame_cache_size)
+    config.loader_start_method = str(args.loader_start_method)
     config.gpus = args.gpus if args.gpus is not None else checkpoint_config.get("gpus")
     config.f1_threshold_step = float(args.f1_threshold_step)
     config.val_neg_pos_ratio = str(args.val_neg_pos_ratio)
@@ -363,6 +403,18 @@ def main():
         "Dataloader workers: "
         f"val={config.val_num_workers}, pin_memory={config.val_pin_memory}"
     )
+    print(
+        "Loader settings: "
+        f"max_open_videos={config.max_open_videos}, "
+        f"frame_cache_size={config.frame_cache_size}, "
+        f"start_method={config.loader_start_method}"
+    )
+    if config.val_video_ids or config.val_halves:
+        print(
+            "Validation filters: "
+            f"video_ids={config.val_video_ids or 'all'}, "
+            f"halves={config.val_halves or 'all'}"
+        )
     print(f"Using device: {device}")
 
     ratio = _parse_optional_ratio(config.val_neg_pos_ratio, "val_neg_pos_ratio")

@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -55,9 +56,75 @@ def make_dataset_stub(
     dataset.preprocess_mode = preprocess_mode
     dataset.input_size = input_size
     dataset.transform = None
+    dataset.row_indices = np.arange(len(labels), dtype=np.int64)
     dataset._norm_mean = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32).view(3, 1, 1, 1)
     dataset._norm_std = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32).view(3, 1, 1, 1)
     return dataset
+
+
+def test_partitioned_parquet_filters_match_and_half(tmp_path):
+    dataset_root = tmp_path / "dense_train"
+    df = pd.DataFrame(
+        [
+            {
+                "video_id": "match_a",
+                "half": 1,
+                "frame": 10,
+                "label": 1,
+                "video_path": "/tmp/a_1.mkv",
+                "ball_x": 1.0,
+                "ball_y": 2.0,
+                "ball_w": 3.0,
+                "ball_h": 4.0,
+                "fps": 25.0,
+                "ball_confidence": 0.9,
+            },
+            {
+                "video_id": "match_a",
+                "half": 2,
+                "frame": 20,
+                "label": 0,
+                "video_path": "/tmp/a_2.mkv",
+                "ball_x": 5.0,
+                "ball_y": 6.0,
+                "ball_w": 7.0,
+                "ball_h": 8.0,
+                "fps": 25.0,
+                "ball_confidence": 0.8,
+            },
+            {
+                "video_id": "match_b",
+                "half": 1,
+                "frame": 30,
+                "label": 0,
+                "video_path": "/tmp/b_1.mkv",
+                "ball_x": 9.0,
+                "ball_y": 10.0,
+                "ball_w": 11.0,
+                "ball_h": 12.0,
+                "fps": 50.0,
+                "ball_confidence": 0.7,
+            },
+        ]
+    )
+    df.to_parquet(dataset_root, index=False, partition_cols=["video_id", "half"])
+
+    dataset = ParquetHeaderDataset(
+        parquet_path=dataset_root,
+        num_frames=16,
+        input_size=224,
+        transform=None,
+        strict_paths=False,
+        preprocess_mode="low_memory_eval",
+        video_id_filters=["match_a"],
+        half_filters=[1],
+    )
+
+    assert len(dataset) == 1
+    assert dataset.class_counts() == {"samples": 1, "positives": 1, "negatives": 0}
+    assert dataset._video_id_at(0) == "match_a"
+    assert int(dataset.halves[0]) == 1
+    assert int(dataset.frames[0]) == 10
 
 
 def test_read_frames_reconstructs_duplicate_indices_from_numpy_batch(monkeypatch):

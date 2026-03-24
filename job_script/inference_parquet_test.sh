@@ -26,7 +26,7 @@ if [[ -z "${PYTHON_BIN}" ]]; then
 	exit 1
 fi
 
-PARQUET="${PARQUET:-${REPO_ROOT}/output/dense_dataset/dense_test.parquet}"
+PARQUET="${PARQUET:-${REPO_ROOT}/output/dense_dataset/dense_test}"
 CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/output/vmae_parquet_ratio10/checkpoints/last.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/output/vmae_parquet_ratio10/test_inference}"
 OUTPUT_CSV="${OUTPUT_CSV:-}"
@@ -41,6 +41,8 @@ BATCH_SIZE="${BATCH_SIZE:-128}"
 # decord is required: pip install decord>=0.6.0
 NUM_WORKERS="${NUM_WORKERS:-6}"
 MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-1}"
+FRAME_CACHE_SIZE="${FRAME_CACHE_SIZE:-128}"
+LOADER_START_METHOD="${LOADER_START_METHOD:-spawn}"
 PIN_MEMORY="${PIN_MEMORY:-off}"
 DEBUG_MEMORY="${DEBUG_MEMORY:-0}"
 GPUS="${GPUS:-0 1}"
@@ -48,7 +50,7 @@ DEVICE="${DEVICE:-}"
 SEED="${SEED:-}"
 PROCESS_BY_MATCH="${PROCESS_BY_MATCH:-0}"
 
-if [[ ! -f "${PARQUET}" ]]; then
+if [[ ! -e "${PARQUET}" ]]; then
 	echo "[ERROR] Parquet not found: ${PARQUET}" >&2
 	exit 1
 fi
@@ -98,6 +100,8 @@ COMMON_ARGS=(
 	--batch-size "${BATCH_SIZE}"
 	--num-workers "${NUM_WORKERS}"
 	--max-open-videos "${MAX_OPEN_VIDEOS}"
+	--frame-cache-size "${FRAME_CACHE_SIZE}"
+	--loader-start-method "${LOADER_START_METHOD}"
 	--pin-memory "${PIN_MEMORY}"
 )
 

@@ -17,6 +17,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # WEIGHTS_PATH: path to SoccerNet RF-DETR weights
 # CONF_THRESHOLD: detection confidence threshold (default: 0.25)
 # BATCH_SIZE: inference batch size (default: 8)
+# DECODE_CHUNK_SIZE: decord decode chunk size (default: 256)
 # TOPK: max detections per frame (default: 15)
 # DEVICE: torch device override (cpu/cuda/mps; auto if empty)
 # OPTIMIZE: 1 to enable RF-DETR optimization (default: 1)
@@ -69,6 +70,7 @@ MODEL_NUM_FRAMES="${MODEL_NUM_FRAMES:-16}"
 WEIGHTS_PATH="${WEIGHTS_PATH:-${REPO_ROOT}/RFDETR-Soccernet/weights/checkpoint_best_regular.pth}"
 CONF_THRESHOLD="${CONF_THRESHOLD:-0.25}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
+DECODE_CHUNK_SIZE="${DECODE_CHUNK_SIZE:-256}"
 TOPK="${TOPK:-15}"
 OUTPUT_BASE="${OUTPUT_BASE:-${REPO_ROOT}/output/dense_dataset}"
 MIN_DECODE_RATIO="${MIN_DECODE_RATIO:-0.5}"
@@ -110,6 +112,7 @@ COMMON_ARGS=(
 	--weights "${WEIGHTS_PATH}"
 	--confidence-threshold "${CONF_THRESHOLD}"
 	--batch-size "${BATCH_SIZE}"
+	--decode-chunk-size "${DECODE_CHUNK_SIZE}"
 	--topk "${TOPK}"
 	--model-num-frames "${MODEL_NUM_FRAMES}"
 	"${LABEL_FLAG}"
@@ -152,8 +155,8 @@ if [[ "${STRICT_DECODE_ERRORS}" == "1" ]]; then
 	COMMON_ARGS+=(--drop-on-decode-error --ffmpeg-bin "${FFMPEG_BIN}")
 fi
 
-TRAIN_OUTPUT="${OUTPUT_BASE}/dense_train.parquet"
-VAL_OUTPUT="${OUTPUT_BASE}/dense_val.parquet"
+TRAIN_OUTPUT="${OUTPUT_BASE}/dense_train"
+VAL_OUTPUT="${OUTPUT_BASE}/dense_val"
 TRAIN_FAILED_LOG="${OUTPUT_BASE}/dense_train_failed_videos.csv"
 VAL_FAILED_LOG="${OUTPUT_BASE}/dense_val_failed_videos.csv"
 TRAIN_FAILED_FRAME_LOG="${OUTPUT_BASE}/dense_train_failed_frames.csv"

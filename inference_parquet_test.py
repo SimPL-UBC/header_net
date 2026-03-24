@@ -10,10 +10,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
@@ -33,8 +32,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--parquet",
-        default=str(HEADER_NET_ROOT / "output" / "dense_dataset" / "dense_test.parquet"),
-        help="Input dense parquet (default: %(default)s)",
+        default=str(HEADER_NET_ROOT / "output" / "dense_dataset" / "dense_test"),
+        help="Input dense parquet file or partitioned parquet dataset directory (default: %(default)s)",
     )
     parser.add_argument(
         "--checkpoint",
@@ -106,6 +105,18 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "on", "off"),
         default="auto",
         help="DataLoader pinned-memory mode: auto uses CUDA-only pinning (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--frame-cache-size",
+        type=int,
+        default=128,
+        help="Per-worker frame cache size (frames)",
+    )
+    parser.add_argument(
+        "--loader-start-method",
+        choices=("spawn", "fork", "forkserver"),
+        default="spawn",
+        help="Multiprocessing start method for DataLoader workers",
     )
     parser.add_argument(
         "--debug-memory",
@@ -390,25 +401,15 @@ def main() -> None:
     print(f"Workers:        {args.num_workers}")
     print(f"Pin memory:     {pin_memory}")
     print(f"Max open vids:  {max_open_videos}")
+    print(f"Frame cache:    {args.frame_cache_size}")
+    print(f"Start method:   {args.loader_start_method}")
     print(f"Preprocess:     {preprocess_mode}")
     print(f"Debug memory:   {args.debug_memory}")
     if gpu_ids:
         print(f"GPUs:           {gpu_ids}")
     print(f"Device:         {device}")
 
-    filter_df = pd.read_parquet(parquet_path, columns=["video_id", "half"])
-    mask = pd.Series(True, index=filter_df.index)
-    if args.video_id:
-        mask &= filter_df["video_id"].astype(str) == str(args.video_id)
-    if args.half is not None:
-        mask &= filter_df["half"].astype(int) == int(args.half)
-
-    subset_indices = filter_df.index[mask].tolist()
-    del filter_df
-    if not subset_indices:
-        raise ValueError("No parquet rows matched the requested filters.")
-
-    base_dataset = ParquetHeaderDataset(
+    dataset = ParquetHeaderDataset(
         parquet_path=parquet_path,
         num_frames=num_frames,
         input_size=input_size,
@@ -416,25 +417,27 @@ def main() -> None:
         strict_paths=True,
         dataset_root=Path(args.dataset_root).expanduser(),
         max_open_videos=max_open_videos,
+        frame_cache_size=int(args.frame_cache_size),
         resample_on_decode_failure=False,
         preprocess_mode=preprocess_mode,
-    )
-    dataset = (
-        Subset(base_dataset, subset_indices)
-        if len(subset_indices) != len(base_dataset)
-        else base_dataset
+        video_id_filters=[args.video_id] if args.video_id else (),
+        half_filters=[args.half] if args.half is not None else (),
     )
 
     num_workers = int(args.num_workers)
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = False
+        loader_kwargs["prefetch_factor"] = 1
+        loader_kwargs["multiprocessing_context"] = args.loader_start_method
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=False,
-        prefetch_factor=1 if num_workers > 0 else None,
         worker_init_fn=_seed_worker,
+        **loader_kwargs,
     )
 
     model = build_model_from_checkpoint(

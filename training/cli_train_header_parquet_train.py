@@ -15,7 +15,11 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train Header Net on parquet metadata (training only)."
     )
-    parser.add_argument("--train_parquet", required=True, help="Path to train parquet")
+    parser.add_argument(
+        "--train_parquet",
+        required=True,
+        help="Path to train parquet file or partitioned parquet dataset directory",
+    )
     parser.add_argument(
         "--dataset_root",
         default="SoccerNet",
@@ -25,6 +29,19 @@ def parse_args():
         "--neg_pos_ratio",
         default="all",
         help="Train negative:positive ratio; 'all' or a positive integer",
+    )
+    parser.add_argument(
+        "--train_video_ids",
+        nargs="+",
+        default=None,
+        help="Optional train video_id filter(s)",
+    )
+    parser.add_argument(
+        "--train_halves",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional train half filter(s)",
     )
 
     parser.add_argument(
@@ -56,6 +73,24 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=30, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of workers")
+    parser.add_argument(
+        "--max_open_videos",
+        type=int,
+        default=8,
+        help="Per-worker cap on open decord readers",
+    )
+    parser.add_argument(
+        "--frame_cache_size",
+        type=int,
+        default=128,
+        help="Per-worker frame cache size (frames)",
+    )
+    parser.add_argument(
+        "--loader_start_method",
+        choices=("spawn", "fork", "forkserver"),
+        default="spawn",
+        help="Multiprocessing start method for DataLoader workers",
+    )
     parser.add_argument(
         "--optimizer",
         default="adamw",
@@ -172,6 +207,12 @@ def main():
         f"Base LR scaled: {args.base_lr} * ({config.batch_size}/256) = {scaled_lr:.6g}"
     )
     print(f"Dataloader workers: train={config.num_workers}")
+    print(
+        "Loader settings: "
+        f"max_open_videos={config.max_open_videos}, "
+        f"frame_cache_size={config.frame_cache_size}, "
+        f"start_method={config.loader_start_method}"
+    )
     print(f"Save checkpoint every N epochs: {config.save_every_n_epochs}")
 
     if config.gpus and torch.cuda.is_available():

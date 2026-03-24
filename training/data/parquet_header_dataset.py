@@ -1,12 +1,13 @@
 import random
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Iterable, Optional, Tuple, Union
 
 import cv2
 import decord
 import numpy as np
 import pandas as pd
+import pyarrow.dataset as pads
 import torch
 import torchvision.transforms as T
 from PIL import Image
@@ -44,6 +45,26 @@ _OPTIONAL_PARQUET_COLUMNS = [
 PREPROCESS_MODES = {"torchvision", "low_memory_eval"}
 
 
+def _normalize_optional_strings(values: Optional[Iterable[Union[str, int]]]) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    normalized = []
+    for value in values:
+        text = str(value).strip()
+        if text:
+            normalized.append(text)
+    return tuple(normalized)
+
+
+def _normalize_optional_ints(values: Optional[Iterable[Union[str, int]]]) -> tuple[int, ...]:
+    if values is None:
+        return ()
+    normalized = []
+    for value in values:
+        normalized.append(int(value))
+    return tuple(normalized)
+
+
 def _factorize_strings(values: pd.Series) -> tuple[np.ndarray, tuple[str, ...]]:
     codes, uniques = pd.factorize(values.astype(str), sort=False)
     codes = codes.astype(np.int32, copy=False)
@@ -59,6 +80,19 @@ def _columns_to_load(available_columns: list[str]) -> list[str]:
     """
     wanted = set(REQUIRED_PARQUET_COLUMNS) | set(_OPTIONAL_PARQUET_COLUMNS)
     return [col for col in available_columns if col in wanted]
+
+
+def _dataset_filter_expression(
+    video_ids: tuple[str, ...],
+    halves: tuple[int, ...],
+):
+    expression = None
+    if video_ids:
+        expression = pads.field("video_id").isin(list(video_ids))
+    if halves:
+        half_expression = pads.field("half").isin([int(value) for value in halves])
+        expression = half_expression if expression is None else (expression & half_expression)
+    return expression
 
 
 def _parse_neg_pos_ratio(value: Union[str, int]) -> Optional[int]:
@@ -101,10 +135,13 @@ class _VideoReaderPool:
     def __init__(self, max_open_videos: int = 8, frame_cache_size: int = 128):
         if max_open_videos <= 0:
             raise ValueError("max_open_videos must be > 0")
+        if frame_cache_size < 0:
+            raise ValueError("frame_cache_size must be >= 0")
         self.max_open_videos = max_open_videos
         self.frame_cache_size = frame_cache_size
         self._readers: "OrderedDict[str, decord.VideoReader]" = OrderedDict()
         self._meta: Dict[str, Tuple[int, int, int]] = {}
+        self._frame_cache: "OrderedDict[tuple[str, int], np.ndarray]" = OrderedDict()
 
     def _open(self, video_path: str) -> decord.VideoReader:
         try:
@@ -114,9 +151,33 @@ class _VideoReaderPool:
         frame_count = len(reader)
         if frame_count == 0:
             raise RuntimeError(f"Video has no frames: {video_path}")
-        h, w, _ = reader[0].shape
+        try:
+            first_frame = reader.get_batch([0]).asnumpy()[0]
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unable to decode the first frame while opening video: {video_path}"
+            ) from exc
+        h, w, _ = first_frame.shape
         self._meta[video_path] = (frame_count, int(w), int(h))
+        self._cache_put(video_path, 0, np.ascontiguousarray(first_frame))
         return reader
+
+    def _cache_get(self, video_path: str, frame_idx: int) -> Optional[np.ndarray]:
+        key = (video_path, int(frame_idx))
+        frame = self._frame_cache.get(key)
+        if frame is None:
+            return None
+        self._frame_cache.move_to_end(key)
+        return frame
+
+    def _cache_put(self, video_path: str, frame_idx: int, frame: np.ndarray) -> None:
+        if self.frame_cache_size == 0:
+            return
+        key = (video_path, int(frame_idx))
+        self._frame_cache[key] = frame
+        self._frame_cache.move_to_end(key)
+        while len(self._frame_cache) > self.frame_cache_size:
+            self._frame_cache.popitem(last=False)
 
     def get(self, video_path: str) -> decord.VideoReader:
         reader = self._readers.get(video_path)
@@ -127,6 +188,9 @@ class _VideoReaderPool:
         while len(self._readers) >= self.max_open_videos:
             old_path, _ = self._readers.popitem(last=False)
             self._meta.pop(old_path, None)
+            stale_keys = [key for key in self._frame_cache.keys() if key[0] == old_path]
+            for key in stale_keys:
+                self._frame_cache.pop(key, None)
 
         reader = self._open(video_path)
         self._readers[video_path] = reader
@@ -137,12 +201,21 @@ class _VideoReaderPool:
             self.get(video_path)
         return self._meta[video_path]
 
-    def read_frame(self, video_path: str, frame_idx: int) -> Optional[np.ndarray]:
+    def read_frame(self, video_path: str, frame_idx: int) -> np.ndarray:
+        cached = self._cache_get(video_path, frame_idx)
+        if cached is not None:
+            return cached
+
         reader = self.get(video_path)
         try:
-            return reader[frame_idx].asnumpy()
-        except Exception:
-            return None
+            frame = reader[int(frame_idx)].asnumpy()
+        except Exception as exc:
+            raise RuntimeError(
+                f"decord failed reading frame {int(frame_idx)} from {video_path}"
+            ) from exc
+        frame = np.ascontiguousarray(frame)
+        self._cache_put(video_path, frame_idx, frame)
+        return frame
 
     def read_frames(self, video_path: str, frame_indices: list[int]) -> list[np.ndarray]:
         """Read multiple frames in one optimized batch call.
@@ -154,19 +227,37 @@ class _VideoReaderPool:
         if len(frame_indices) == 0:
             return []
 
-        reader = self.get(video_path)
-        unique_indices, inverse = np.unique(
-            np.asarray(frame_indices, dtype=np.int64), return_inverse=True
-        )
-        # decord 0.6.0 returns an NDArray that supports asnumpy() but not direct
-        # Python indexing, so convert once and return per-frame views instead of
-        # materializing a second full window copy via batch[inverse].
-        batch = reader.get_batch(unique_indices.tolist()).asnumpy()
-        return [batch[int(idx)] for idx in inverse.tolist()]
+        requested = [int(value) for value in frame_indices]
+        frames_by_index: Dict[int, np.ndarray] = {}
+        missing_indices: list[int] = []
+        for frame_idx in requested:
+            cached = self._cache_get(video_path, frame_idx)
+            if cached is not None:
+                frames_by_index[frame_idx] = cached
+            elif frame_idx not in frames_by_index:
+                missing_indices.append(frame_idx)
+
+        if missing_indices:
+            reader = self.get(video_path)
+            unique_missing = sorted(set(missing_indices))
+            try:
+                batch = reader.get_batch(unique_missing).asnumpy()
+            except Exception as exc:
+                raise RuntimeError(
+                    "decord failed reading frame batch "
+                    f"{unique_missing[0]}..{unique_missing[-1]} from {video_path}"
+                ) from exc
+            for offset, frame_idx in enumerate(unique_missing):
+                frame = np.ascontiguousarray(batch[offset])
+                frames_by_index[frame_idx] = frame
+                self._cache_put(video_path, frame_idx, frame)
+
+        return [frames_by_index[int(frame_idx)] for frame_idx in requested]
 
     def close(self) -> None:
         self._readers.clear()
         self._meta.clear()
+        self._frame_cache.clear()
 
     def __del__(self) -> None:
         self.close()
@@ -180,15 +271,51 @@ class DeterministicRatioSampler(Sampler[int]):
         neg_pos_ratio: Union[str, int],
         seed: int = 42,
         shuffle: bool = True,
+        group_codes: Optional[np.ndarray] = None,
+        order_values: Optional[np.ndarray] = None,
     ):
         self.positive_indices = np.asarray(positive_indices, dtype=np.int64)
         self.negative_indices = np.asarray(negative_indices, dtype=np.int64)
         self.neg_pos_ratio = _parse_neg_pos_ratio(neg_pos_ratio)
         self.seed = int(seed)
         self.shuffle = bool(shuffle)
+        self.group_codes = (
+            np.asarray(group_codes, dtype=np.int64) if group_codes is not None else None
+        )
+        self.order_values = (
+            np.asarray(order_values, dtype=np.int64) if order_values is not None else None
+        )
         self.current_epoch = 0
         self._indices = np.array([], dtype=np.int64)
         self.set_epoch(0)
+
+    def _order_indices(
+        self,
+        indices: np.ndarray,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        if len(indices) == 0:
+            return indices
+        if self.group_codes is None or self.order_values is None:
+            if self.shuffle:
+                rng.shuffle(indices)
+            return indices
+
+        group_codes = self.group_codes[indices]
+        unique_groups = np.unique(group_codes)
+        if self.shuffle and len(unique_groups) > 1:
+            rng.shuffle(unique_groups)
+
+        ordered_chunks = []
+        for group_code in unique_groups.tolist():
+            group_mask = group_codes == group_code
+            group_indices = indices[group_mask]
+            group_order = np.argsort(self.order_values[group_indices], kind="stable")
+            ordered_chunks.append(group_indices[group_order])
+
+        if not ordered_chunks:
+            return np.array([], dtype=np.int64)
+        return np.concatenate(ordered_chunks).astype(np.int64, copy=False)
 
     def set_epoch(self, epoch: int) -> None:
         self.current_epoch = int(epoch)
@@ -205,9 +332,10 @@ class DeterministicRatioSampler(Sampler[int]):
                 neg = np.array([], dtype=np.int64)
 
         indices = np.concatenate([self.positive_indices, neg])
-        if self.shuffle and len(indices) > 0:
-            rng.shuffle(indices)
-        self._indices = indices.astype(np.int64, copy=False)
+        self._indices = self._order_indices(
+            indices.astype(np.int64, copy=False),
+            rng,
+        )
 
     def __iter__(self):
         return iter(self._indices.tolist())
@@ -243,6 +371,9 @@ class ParquetHeaderDataset(Dataset):
         max_resample_attempts: int = 20,
         resample_on_decode_failure: bool = True,
         preprocess_mode: str = "torchvision",
+        video_id_filters: Optional[Iterable[Union[str, int]]] = None,
+        half_filters: Optional[Iterable[Union[str, int]]] = None,
+        frame_cache_size: int = 128,
     ):
         self.parquet_path = Path(parquet_path)
         if not self.parquet_path.exists():
@@ -257,6 +388,8 @@ class ParquetHeaderDataset(Dataset):
         self.max_resample_attempts = max(1, int(max_resample_attempts))
         self.resample_on_decode_failure = bool(resample_on_decode_failure)
         self.preprocess_mode = str(preprocess_mode)
+        self.video_id_filters = _normalize_optional_strings(video_id_filters)
+        self.half_filters = _normalize_optional_ints(half_filters)
         if self.preprocess_mode not in PREPROCESS_MODES:
             raise ValueError(
                 f"preprocess_mode must be one of {sorted(PREPROCESS_MODES)}, "
@@ -267,20 +400,14 @@ class ParquetHeaderDataset(Dataset):
             output_size=self.input_size,
             default_radius=default_radius,
         )
-        self.reader_pool = _VideoReaderPool(max_open_videos=max_open_videos)
+        self.reader_pool = _VideoReaderPool(
+            max_open_videos=max_open_videos,
+            frame_cache_size=frame_cache_size,
+        )
         self._norm_mean = torch.tensor(VMAE_MEAN, dtype=torch.float32).view(3, 1, 1, 1)
         self._norm_std = torch.tensor(VMAE_STD, dtype=torch.float32).view(3, 1, 1, 1)
 
-        # Only load the columns the dataset actually uses.  This skips
-        # heavyweight columns like ``other_detections`` (JSON blobs with
-        # per-frame bounding boxes) which can consume several GB of RAM on
-        # large parquet files but are never accessed by __getitem__.
-        import pyarrow.parquet as pq
-
-        all_columns = pq.read_schema(self.parquet_path).names
-        self.df = pd.read_parquet(
-            self.parquet_path, columns=_columns_to_load(all_columns)
-        )
+        self.df = self._load_dataframe()
         self._validate_schema()
         self._prepare_arrays()
         self._validate_paths()
@@ -295,6 +422,31 @@ class ParquetHeaderDataset(Dataset):
         self.positive_indices = np.where(labels == 1)[0].astype(np.int64)
         self.negative_indices = np.where(labels == 0)[0].astype(np.int64)
 
+    def _load_dataframe(self) -> pd.DataFrame:
+        dataset_kwargs = {"format": "parquet"}
+        if self.parquet_path.is_dir():
+            dataset_kwargs["partitioning"] = "hive"
+        dataset = pads.dataset(str(self.parquet_path), **dataset_kwargs)
+        all_columns = list(dataset.schema.names)
+        columns = _columns_to_load(all_columns)
+        filter_expression = _dataset_filter_expression(
+            self.video_id_filters,
+            self.half_filters,
+        )
+        table = dataset.to_table(columns=columns, filter=filter_expression)
+        df = table.to_pandas()
+        if df.empty:
+            filter_parts = []
+            if self.video_id_filters:
+                filter_parts.append(f"video_id in {list(self.video_id_filters)}")
+            if self.half_filters:
+                filter_parts.append(f"half in {list(self.half_filters)}")
+            filter_text = ", ".join(filter_parts) if filter_parts else "no filters"
+            raise ValueError(
+                f"No parquet rows matched {filter_text} from {self.parquet_path}"
+            )
+        return df.reset_index(drop=True)
+
     def _validate_schema(self) -> None:
         missing = [col for col in REQUIRED_PARQUET_COLUMNS if col not in self.df.columns]
         if missing:
@@ -308,6 +460,7 @@ class ParquetHeaderDataset(Dataset):
         self.video_id_codes, self.video_id_table = _factorize_strings(self.df["video_id"])
         self.halves = self.df["half"].astype(np.int16).to_numpy()
         self.frames = self.df["frame"].astype(np.int64).to_numpy()
+        self.row_indices = np.arange(len(self.df), dtype=np.int64)
         self.labels = self.df["label"].astype(np.int8).to_numpy()
         self.video_path_codes, self.video_path_table = _factorize_strings(self.df["video_path"])
         self.ball_x = pd.to_numeric(self.df["ball_x"], errors="coerce").to_numpy(np.float32)
@@ -316,6 +469,8 @@ class ParquetHeaderDataset(Dataset):
         self.ball_h = pd.to_numeric(self.df["ball_h"], errors="coerce").to_numpy(np.float32)
         self.fps = self._numeric_column("fps")
         self.ball_confidence = self._numeric_column("ball_confidence")
+        self.sample_group_codes = self.video_path_codes.astype(np.int64, copy=False)
+        self.sample_order_values = self.frames.astype(np.int64, copy=False)
 
         unique_labels = set(np.unique(self.labels).tolist())
         if not unique_labels.issubset({0, 1}):
@@ -469,7 +624,7 @@ class ParquetHeaderDataset(Dataset):
                 "frame": int(center_frame),
                 "path": str(video_path),
                 "video_path": str(video_path),
-                "row_idx": int(row_idx),
+                "row_idx": int(self.row_indices[row_idx]),
                 "fps": float(self.fps[row_idx]),
                 "ball_x": float(self.ball_x[row_idx]),
                 "ball_y": float(self.ball_y[row_idx]),
@@ -526,6 +681,16 @@ def _build_torch_generator(seed: int) -> torch.Generator:
     return generator
 
 
+def _dataloader_kwargs(num_workers: int, config: Config) -> Dict[str, object]:
+    kwargs: Dict[str, object] = {}
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        start_method = str(getattr(config, "loader_start_method", "spawn")).strip()
+        if start_method:
+            kwargs["multiprocessing_context"] = start_method
+    return kwargs
+
+
 def build_parquet_train_dataloader(config: Config):
     train_transform = get_transforms(config.input_size, is_training=True)
     train_dataset = ParquetHeaderDataset(
@@ -535,6 +700,10 @@ def build_parquet_train_dataloader(config: Config):
         transform=train_transform,
         strict_paths=True,
         dataset_root=config.dataset_root,
+        max_open_videos=int(getattr(config, "max_open_videos", 8)),
+        frame_cache_size=int(getattr(config, "frame_cache_size", 128)),
+        video_id_filters=getattr(config, "train_video_ids", ()),
+        half_filters=getattr(config, "train_halves", ()),
     )
 
     if len(train_dataset.positive_indices) == 0:
@@ -546,6 +715,8 @@ def build_parquet_train_dataloader(config: Config):
         neg_pos_ratio=config.neg_pos_ratio,
         seed=config.seed,
         shuffle=True,
+        group_codes=train_dataset.sample_group_codes,
+        order_values=train_dataset.sample_order_values,
     )
 
     generator = _build_torch_generator(config.seed)
@@ -559,7 +730,7 @@ def build_parquet_train_dataloader(config: Config):
         pin_memory=True,
         worker_init_fn=_seed_worker,
         generator=generator,
-        persistent_workers=bool(num_workers > 0),
+        **_dataloader_kwargs(num_workers, config),
     )
     return train_loader, train_dataset, train_sampler
 
@@ -579,6 +750,10 @@ def build_parquet_val_dataloader(
         transform=val_transform,
         strict_paths=True,
         dataset_root=config.dataset_root,
+        max_open_videos=int(getattr(config, "max_open_videos", 8)),
+        frame_cache_size=int(getattr(config, "frame_cache_size", 128)),
+        video_id_filters=getattr(config, "val_video_ids", ()),
+        half_filters=getattr(config, "val_halves", ()),
     )
 
     val_sampler = None
@@ -594,6 +769,8 @@ def build_parquet_val_dataloader(
             neg_pos_ratio=ratio,
             seed=int(config.seed) + int(seed_offset),
             shuffle=shuffle,
+            group_codes=val_dataset.sample_group_codes,
+            order_values=val_dataset.sample_order_values,
         )
 
     generator = _build_torch_generator(config.seed)
@@ -612,7 +789,7 @@ def build_parquet_val_dataloader(
         pin_memory=resolved_pin_memory,
         worker_init_fn=_seed_worker,
         generator=generator,
-        persistent_workers=bool(val_num_workers > 0),
+        **_dataloader_kwargs(val_num_workers, config),
     )
     return val_loader, val_dataset, val_sampler
 

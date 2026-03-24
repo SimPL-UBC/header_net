@@ -31,7 +31,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument(
         "--output-path",
-        default=str(DEFAULT_OUTPUT_BASE / "dense_test.parquet"),
+        default=str(DEFAULT_OUTPUT_BASE / "dense_test"),
         help="Output parquet path (default: %(default)s)",
     )
     parser.add_argument(

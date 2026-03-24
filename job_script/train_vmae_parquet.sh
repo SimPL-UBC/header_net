@@ -15,6 +15,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # FINETUNE_MODE: full|frozen|partial
 # UNFREEZE_BLOCKS
 # EPOCHS, BATCH_SIZE, NUM_FRAMES, NUM_WORKERS
+# MAX_OPEN_VIDEOS, FRAME_CACHE_SIZE, LOADER_START_METHOD
 # OPTIMIZER, BASE_LR, LAYER_LR_DECAY, BETAS, WEIGHT_DECAY
 # LOSS, FOCAL_GAMMA, FOCAL_ALPHA
 # SEED, GPUS
@@ -47,7 +48,7 @@ if [[ -z "${PYTHON_BIN}" ]]; then
   exit 1
 fi
 
-TRAIN_PARQUET="${TRAIN_PARQUET:-${REPO_ROOT}/output/dense_dataset/dense_train.parquet}"
+TRAIN_PARQUET="${TRAIN_PARQUET:-${REPO_ROOT}/output/dense_dataset/dense_train}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/SoccerNet}"
 NEG_POS_RATIO="${NEG_POS_RATIO:-10}"
 BACKBONE_CKPT="${BACKBONE_CKPT:-${REPO_ROOT}/checkpoints/VideoMAEv2-Base}"
@@ -59,6 +60,9 @@ EPOCHS="${EPOCHS:-30}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 NUM_FRAMES="${NUM_FRAMES:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
+MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-8}"
+FRAME_CACHE_SIZE="${FRAME_CACHE_SIZE:-128}"
+LOADER_START_METHOD="${LOADER_START_METHOD:-spawn}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
 BASE_LR="${BASE_LR:-1e-3}"
 LAYER_LR_DECAY="${LAYER_LR_DECAY:-0.75}"
@@ -116,8 +120,10 @@ if [[ "${VALIDATE_VIDEO_LOAD}" == "1" ]]; then
 import sys
 from pathlib import Path
 
-import cv2
+import decord
 import pandas as pd
+
+decord.bridge.set_bridge("native")
 
 train_parquet = Path(sys.argv[1])
 max_errors = int(sys.argv[2])
@@ -128,18 +134,19 @@ if not train_parquet.exists():
 else:
     df = pd.read_parquet(train_parquet, columns=["video_path"])
     for video_path in pd.unique(df["video_path"].astype(str)):
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
+        try:
+            reader = decord.VideoReader(video_path, ctx=decord.cpu())
+        except Exception:
             bad.append(("train", video_path, "open_failed"))
             continue
 
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        ok, _ = cap.read()
-        cap.release()
-
+        frame_count = len(reader)
         if frame_count <= 0:
             bad.append(("train", video_path, f"invalid_frame_count={frame_count}"))
-        elif not ok:
+            continue
+        try:
+            reader.get_batch([0]).asnumpy()
+        except Exception:
             bad.append(("train", video_path, "first_frame_decode_failed"))
 
 if bad:
@@ -177,6 +184,9 @@ ARGS=(
   --num_frames "${NUM_FRAMES}"
   --batch_size "${BATCH_SIZE}"
   --num_workers "${NUM_WORKERS}"
+  --max_open_videos "${MAX_OPEN_VIDEOS}"
+  --frame_cache_size "${FRAME_CACHE_SIZE}"
+  --loader_start_method "${LOADER_START_METHOD}"
   --optimizer "${OPTIMIZER}"
   --base_lr "${BASE_LR}"
   --layer_lr_decay "${LAYER_LR_DECAY}"
