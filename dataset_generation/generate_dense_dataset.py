@@ -462,6 +462,7 @@ def run_dense_detection(
     decode_chunk_size: int,
     score_threshold: float,
     topk: int,
+    progress_bar=None,
 ) -> Tuple[Dict[int, List[Dict[str, float]]], int, int]:
     """Process ALL frames of a video with batched RF-DETR inference.
 
@@ -478,6 +479,12 @@ def run_dense_detection(
     total_frames = len(reader)
     raw: Dict[int, List[Dict[str, float]]] = {}
     decoded = 0
+
+    if progress_bar is not None:
+        progress_bar.total = total_frames
+        progress_bar.n = 0
+        progress_bar.set_postfix(decoded=f"0/{total_frames}", refresh=False)
+        progress_bar.refresh()
 
     batch_frames: List[np.ndarray] = []
     batch_indices: List[int] = []
@@ -501,6 +508,12 @@ def run_dense_detection(
                 decoded_frames.append((frame_idx, np.ascontiguousarray(frame)))
 
         decoded += len(decoded_frames)
+        if progress_bar is not None:
+            progress_bar.update(len(chunk_indices))
+            progress_bar.set_postfix(
+                decoded=f"{decoded}/{total_frames}",
+                refresh=False,
+            )
         for frame_idx, rgb in decoded_frames:
             batch_frames.append(rgb)
             batch_indices.append(frame_idx)
@@ -563,6 +576,13 @@ def _directory_size_bytes(path: Path) -> int:
         if file_path.is_file():
             total += file_path.stat().st_size
     return total
+
+
+def _format_video_progress_label(source: VideoSource, max_chars: int = 56) -> str:
+    label = f"{source.match_name} H{source.half}"
+    if len(label) <= max_chars:
+        return label
+    return label[: max_chars - 3] + "..."
 
 
 def _build_model_window_offsets(num_frames: int) -> np.ndarray:
@@ -802,10 +822,17 @@ def main() -> None:
     if not output_is_file:
         output_path.mkdir(parents=True, exist_ok=True)
 
-    for key, source in tqdm(sources.items(), desc="Processing videos"):
+    video_progress = tqdm(
+        sources.items(),
+        desc="Processing videos",
+        unit="video",
+        dynamic_ncols=True,
+    )
+    for key, source in video_progress:
         fps = fps_map[key]
         stride = stride_map[key]
         header_frames = label_lookup.get(key, set())
+        video_progress.set_postfix(video=_format_video_progress_label(source), refresh=False)
 
         t_video = time.perf_counter()
         if args.drop_on_decode_error:
@@ -834,6 +861,14 @@ def main() -> None:
                     f"({error_preview})"
                 )
                 continue
+        frame_progress = tqdm(
+            total=max(int(source.frame_count), 0),
+            desc=_format_video_progress_label(source),
+            unit="frame",
+            leave=False,
+            dynamic_ncols=True,
+            position=1,
+        )
         try:
             raw_dets, total_frames, decoded = run_dense_detection(
                 source,
@@ -842,8 +877,10 @@ def main() -> None:
                 decode_chunk_size=args.decode_chunk_size,
                 score_threshold=args.confidence_threshold,
                 topk=args.topk,
+                progress_bar=frame_progress,
             )
         except Exception as exc:
+            frame_progress.close()
             elapsed = time.perf_counter() - t_video
             failed_records.append(
                 {
@@ -860,6 +897,7 @@ def main() -> None:
             )
             print(f"\n[WARN] Failed to process {key}: {exc}")
             continue
+        frame_progress.close()
 
         requested_frames = int(total_frames) if int(total_frames) > 0 else int(decoded)
         read_ratio = (decoded / requested_frames) if requested_frames else 0.0
