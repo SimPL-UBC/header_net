@@ -1,5 +1,6 @@
 import argparse
 import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -69,6 +70,11 @@ def parse_args():
     )
     parser.add_argument("--run_name", required=True, help="Run name")
     parser.add_argument("--output_root", default="output/vmae", help="Output root")
+    parser.add_argument(
+        "--resume_checkpoint",
+        default=None,
+        help="Optional checkpoint path to resume model and optimizer state from",
+    )
 
     parser.add_argument("--epochs", type=int, default=30, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
@@ -167,10 +173,8 @@ def _validate_optional_ratio(value, arg_name):
 
 
 def _save_checkpoint(model, optimizer, args, path, epoch):
-    if isinstance(model, torch.nn.DataParallel):
-        state_dict = model.module.state_dict()
-    else:
-        state_dict = model.state_dict()
+    checkpoint_model = _checkpoint_model(model)
+    state_dict = checkpoint_model.state_dict()
 
     torch.save(
         {
@@ -181,6 +185,57 @@ def _save_checkpoint(model, optimizer, args, path, epoch):
         },
         path,
     )
+
+
+def _checkpoint_model(model):
+    if isinstance(model, torch.nn.DataParallel):
+        return model.module
+    return model
+
+
+def _move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def _load_resume_checkpoint(model, optimizer, checkpoint_path, device):
+    resume_path = Path(checkpoint_path)
+    if not resume_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+
+    checkpoint = torch.load(resume_path, map_location="cpu")
+    checkpoint_model = _checkpoint_model(model)
+    load_result = checkpoint_model.load_state_dict(checkpoint["state_dict"], strict=True)
+    if load_result.missing_keys or load_result.unexpected_keys:
+        raise RuntimeError(
+            "Strict checkpoint load reported key mismatches: "
+            f"missing={load_result.missing_keys}, "
+            f"unexpected={load_result.unexpected_keys}"
+        )
+
+    optimizer_state = checkpoint.get("optimizer_state")
+    if optimizer_state is None:
+        raise RuntimeError(
+            f"Resume checkpoint is missing optimizer_state: {resume_path}"
+        )
+    optimizer.load_state_dict(optimizer_state)
+    _move_optimizer_state_to_device(optimizer, device)
+
+    completed_epoch = int(checkpoint.get("epoch", 0))
+    return resume_path, completed_epoch
+
+
+def _ensure_metrics_file(metrics_path, append=False):
+    if append and metrics_path.exists():
+        return
+
+    with open(metrics_path, "w") as f:
+        f.write(
+            "epoch,train_loss,train_acc,train_f1,lr_backbone,lr_head,"
+            "train_samples,train_pos,train_neg,checkpoint\n"
+        )
 
 
 def main():
@@ -256,14 +311,30 @@ def main():
     if config.save_epoch_indices:
         epoch_indices_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(metrics_path, "w") as f:
-        f.write(
-            "epoch,train_loss,train_acc,train_f1,lr_backbone,lr_head,"
-            "train_samples,train_pos,train_neg,checkpoint\n"
+    start_epoch = 1
+    resumed_from = None
+    if args.resume_checkpoint:
+        resumed_from, completed_epoch = _load_resume_checkpoint(
+            model,
+            optimizer,
+            args.resume_checkpoint,
+            device,
+        )
+        start_epoch = completed_epoch + 1
+        if start_epoch > config.epochs:
+            raise ValueError(
+                f"Resume checkpoint {resumed_from} is already at epoch {completed_epoch}, "
+                f"which is beyond requested total epochs={config.epochs}."
+            )
+        print(
+            f"Resuming from checkpoint: {resumed_from} "
+            f"(completed epoch {completed_epoch}, next epoch {start_epoch})"
         )
 
-    last_epoch = 0
-    for epoch in range(1, config.epochs + 1):
+    _ensure_metrics_file(metrics_path, append=start_epoch > 1)
+
+    last_epoch = start_epoch - 1
+    for epoch in range(start_epoch, config.epochs + 1):
         last_epoch = epoch
         train_sampler.set_epoch(epoch)
         train_counts = train_sampler.get_counts()
@@ -319,6 +390,7 @@ def main():
                 "last_epoch": int(last_epoch),
                 "final_checkpoint": "checkpoints/last.pt",
                 "metrics_file": metrics_path.name,
+                "resumed_from": str(resumed_from) if resumed_from is not None else "",
             },
             f,
             indent=4,

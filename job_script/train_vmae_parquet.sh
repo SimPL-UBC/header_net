@@ -12,6 +12,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # NEG_POS_RATIO: all|positive integer (e.g., 6)
 # BACKBONE_CKPT: VideoMAE checkpoint directory
 # OUTPUT_ROOT, RUN_NAME
+# RESUME_CHECKPOINT: optional periodic checkpoint path (e.g. output/vmae/<run>/checkpoints/epoch_014.pt)
 # FINETUNE_MODE: full|frozen|partial
 # UNFREEZE_BLOCKS
 # EPOCHS, BATCH_SIZE, NUM_FRAMES, NUM_WORKERS
@@ -52,15 +53,16 @@ TRAIN_PARQUET="${TRAIN_PARQUET:-${REPO_ROOT}/output/dense_dataset/dense_train}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/SoccerNet}"
 NEG_POS_RATIO="${NEG_POS_RATIO:-10}"
 BACKBONE_CKPT="${BACKBONE_CKPT:-${REPO_ROOT}/checkpoints/VideoMAEv2-Base}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/output/vmae}"
-RUN_NAME="${RUN_NAME:-vmae_parquet_ratio10}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/output/vmae_parquet_ratio10_new}"
+RUN_NAME="${RUN_NAME:-vmae_parquet_ratio10_new}"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 FINETUNE_MODE="${FINETUNE_MODE:-full}"
 UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-4}"
 EPOCHS="${EPOCHS:-30}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_FRAMES="${NUM_FRAMES:-16}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-2}"
+MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-2}"
 FRAME_CACHE_SIZE="${FRAME_CACHE_SIZE:-128}"
 LOADER_START_METHOD="${LOADER_START_METHOD:-spawn}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
@@ -204,6 +206,10 @@ if [[ "${SAVE_EPOCH_INDICES}" == "true" ]]; then
   ARGS+=(--save_epoch_indices)
 else
   ARGS+=(--no-save_epoch_indices)
+fi
+
+if [[ -n "${RESUME_CHECKPOINT}" ]]; then
+  ARGS+=(--resume_checkpoint "${RESUME_CHECKPOINT}")
 fi
 
 "${PYTHON_BIN}" "${ARGS[@]}"
