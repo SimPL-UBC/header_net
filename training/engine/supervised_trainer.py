@@ -54,6 +54,15 @@ class Trainer:
         else:
             self.criterion = nn.CrossEntropyLoss()
 
+    def _per_sample_loss(self, logits, targets):
+        if getattr(self.config, "loss_type", "focal") == "focal":
+            return FocalLoss(
+                gamma=getattr(self.config, "focal_gamma", 2.0),
+                alpha=getattr(self.config, "focal_alpha", 0.75),
+                reduction="none",
+            )(logits, targets)
+        return F.cross_entropy(logits, targets, reduction="none")
+
     def train_one_epoch(self, model, train_loader, optimizer, epoch):
         model.train()
         running_loss = 0.0
@@ -119,9 +128,8 @@ class Trainer:
                 targets = targets.to(self.device)
                 
                 outputs = model(inputs)
-                loss = self.criterion(outputs, targets)
-                
-                running_loss += loss.item() * inputs.size(0)
+                sample_losses = self._per_sample_loss(outputs, targets)
+                running_loss += sample_losses.sum().item()
                 
                 probs = F.softmax(outputs, dim=1)
                 _, preds = torch.max(outputs, 1)
@@ -138,8 +146,10 @@ class Trainer:
                         "video_id": meta["video_id"][k],
                         "half": meta["half"][k],
                         "frame": meta["frame"][k].item(),
+                        "row_idx": meta["row_idx"][k].item(),
                         "path": meta["path"][k],
                         "label": targets[k].item(),
+                        "loss": float(sample_losses[k].item()),
                         # Assuming class 1 is header, class 0 is non-header
                         "prob_header": probs[k, 1].item() if probs.shape[1] > 1 else 0.0,
                         "prob_non_header": probs[k, 0].item(),

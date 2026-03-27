@@ -42,6 +42,8 @@ fi
 # SEED, GPUS
 # F1_THRESHOLD_STEP
 # SAVE_PREDICTIONS: true|false
+# SKIP_EXISTING: true|false, skip when metrics output already exists
+# REUSE_PREDICTIONS: true|false, rebuild metrics from an existing predictions CSV when possible
 # PREDICTIONS_PATH, METRICS_PATH
 
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-${REPO_ROOT}/output/vmae_parquet_ratio10/checkpoints/last.pt}"
@@ -74,6 +76,8 @@ SEED="${SEED:-}"
 GPUS="${GPUS:-0}"
 F1_THRESHOLD_STEP="${F1_THRESHOLD_STEP:-0.01}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-true}"
+SKIP_EXISTING="${SKIP_EXISTING:-false}"
+REUSE_PREDICTIONS="${REUSE_PREDICTIONS:-true}"
 PREDICTIONS_PATH="${PREDICTIONS_PATH:-}"
 METRICS_PATH="${METRICS_PATH:-}"
 
@@ -183,6 +187,16 @@ if is_enabled "${SAVE_PREDICTIONS}"; then
 else
 	ARGS+=(--no-save_predictions)
 fi
+if is_enabled "${SKIP_EXISTING}"; then
+	ARGS+=(--skip_existing)
+else
+	ARGS+=(--no-skip_existing)
+fi
+if is_enabled "${REUSE_PREDICTIONS}"; then
+	ARGS+=(--reuse_predictions)
+else
+	ARGS+=(--no-reuse_predictions)
+fi
 
 echo "============================================================"
 echo "Parquet validation"
@@ -197,6 +211,8 @@ echo "Frame cache:      ${FRAME_CACHE_SIZE}"
 echo "Start method:     ${LOADER_START_METHOD}"
 echo "Val neg:pos:      ${VAL_NEG_POS_RATIO}"
 echo "Save predictions: ${SAVE_PREDICTIONS}"
+echo "Skip existing:    ${SKIP_EXISTING}"
+echo "Reuse preds:      ${REUSE_PREDICTIONS}"
 if [[ -n "${VIDEO_ID}" ]]; then
 	echo "Video filter:     ${VIDEO_ID}"
 fi

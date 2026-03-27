@@ -49,6 +49,7 @@ GPUS="${GPUS:-0 1}"
 DEVICE="${DEVICE:-}"
 SEED="${SEED:-}"
 PROCESS_BY_MATCH="${PROCESS_BY_MATCH:-0}"
+RESUME_OUTPUT="${RESUME_OUTPUT:-0}"
 
 if [[ ! -e "${PARQUET}" ]]; then
 	echo "[ERROR] Parquet not found: ${PARQUET}" >&2
@@ -129,6 +130,9 @@ if [[ -n "${SEED}" ]]; then
 fi
 if is_enabled "${DEBUG_MEMORY}"; then
 	COMMON_ARGS+=(--debug-memory)
+fi
+if is_enabled "${RESUME_OUTPUT}"; then
+	COMMON_ARGS+=(--resume-output)
 fi
 
 if is_enabled "${PROCESS_BY_MATCH}"; then

@@ -5,7 +5,8 @@ from typing import List, Dict
 def save_predictions(predictions: List[Dict], path: Path):
     """
     Writes val_predictions.csv.
-    predictions: List of dicts with keys: video_id, half, frame, path, label, prob_header, prob_non_header, pred_label
+    predictions: List of dicts with keys such as row_idx, video_id, half, frame,
+    path, label, loss, prob_header, prob_non_header, pred_label.
     """
     if not predictions:
         return
@@ -13,8 +14,18 @@ def save_predictions(predictions: List[Dict], path: Path):
     df = pd.DataFrame(predictions)
     
     # Ensure column order
-    # Columns: video_id, half, frame, path, label, prob_header, prob_non_header, pred_label
-    desired_cols = ["video_id", "half", "frame", "path", "label", "prob_header", "prob_non_header", "pred_label"]
+    desired_cols = [
+        "row_idx",
+        "video_id",
+        "half",
+        "frame",
+        "path",
+        "label",
+        "loss",
+        "prob_header",
+        "prob_non_header",
+        "pred_label",
+    ]
     
     # Filter to available columns and reorder
     cols = [c for c in desired_cols if c in df.columns]

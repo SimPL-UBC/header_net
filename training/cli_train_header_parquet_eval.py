@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 from pathlib import Path
 
@@ -184,6 +185,18 @@ def parse_args():
         default=None,
         help="Custom metrics output path (default: <output_dir>/final_test_metrics.json)",
     )
+    parser.add_argument(
+        "--skip_existing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip evaluation when metrics output already exists",
+    )
+    parser.add_argument(
+        "--reuse_predictions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse an existing predictions CSV to rebuild metrics when possible",
+    )
     return parser.parse_args()
 
 
@@ -280,6 +293,74 @@ def _resolve_output_dir(checkpoint_path: Path, output_dir_arg: str):
     if checkpoint_path.parent.name == "checkpoints":
         return checkpoint_path.parent.parent
     return checkpoint_path.parent
+
+
+def _load_saved_predictions(predictions_path: Path):
+    predictions = []
+    with open(predictions_path, "r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            return predictions
+        for row in reader:
+            if not row:
+                continue
+            predictions.append(
+                {
+                    "row_idx": int(row["row_idx"]) if row.get("row_idx") not in (None, "") else -1,
+                    "video_id": row.get("video_id", ""),
+                    "half": row.get("half", ""),
+                    "frame": int(row["frame"]),
+                    "path": row.get("path", ""),
+                    "label": int(row["label"]),
+                    "loss": float(row["loss"]) if row.get("loss") not in (None, "") else None,
+                    "prob_header": float(row["prob_header"]),
+                    "prob_non_header": float(row["prob_non_header"]),
+                    "pred_label": int(row["pred_label"]) if row.get("pred_label") not in (None, "") else 0,
+                }
+            )
+    return predictions
+
+
+def _finalize_metrics_from_predictions(val_preds, f1_threshold_step):
+    if not val_preds:
+        raise RuntimeError("Validation produced no predictions.")
+
+    loss_values = [pred.get("loss") for pred in val_preds]
+    if any(loss is None for loss in loss_values):
+        raise RuntimeError(
+            "Predictions CSV is missing per-sample loss values and cannot be reused "
+            "to compute exact validation metrics."
+        )
+
+    labels = np.array([int(pred["label"]) for pred in val_preds], dtype=np.int64)
+    probs = np.array([float(pred["prob_header"]) for pred in val_preds], dtype=np.float64)
+    sweep = _threshold_sweep_positive_f1(
+        labels=labels,
+        probs=probs,
+        step=f1_threshold_step,
+    )
+    pred_labels = sweep["pred_labels"]
+    for idx, pred in enumerate(val_preds):
+        pred["pred_label"] = int(pred_labels[idx])
+
+    final_metrics = {
+        "val_loss": float(np.mean(np.array(loss_values, dtype=np.float64))),
+        "val_acc": float(sweep["acc"]),
+        "val_precision": float(sweep["pos_precision"]),
+        "val_recall": float(sweep["pos_recall"]),
+        "val_f1": float(sweep["pos_f1"]),
+        "val_auc": float(sweep["auc"]),
+        "val_weighted_precision": float(sweep["weighted_precision"]),
+        "val_weighted_recall": float(sweep["weighted_recall"]),
+        "val_weighted_f1": float(sweep["weighted_f1"]),
+        "val_best_threshold": float(sweep["threshold"]),
+    }
+    eval_counts = {
+        "samples": int(labels.shape[0]),
+        "positives": int(labels.sum()),
+        "negatives": int(labels.shape[0] - labels.sum()),
+    }
+    return final_metrics, eval_counts
 
 
 def _run_validation_with_retry(trainer, model, val_loader, epoch_label):
@@ -388,6 +469,49 @@ def main():
         else output_dir / "final_test_predictions.csv"
     )
 
+    if args.skip_existing and metrics_path.exists() and metrics_path.stat().st_size > 0:
+        print(f"Skipping validation because metrics already exist: {metrics_path}")
+        return
+
+    if (
+        args.reuse_predictions
+        and args.save_predictions
+        and predictions_path.exists()
+        and predictions_path.stat().st_size > 0
+    ):
+        try:
+            reused_predictions = _load_saved_predictions(predictions_path)
+            final_metrics, eval_counts = _finalize_metrics_from_predictions(
+                reused_predictions,
+                config.f1_threshold_step,
+            )
+        except Exception as exc:
+            print(
+                "Existing predictions could not be reused; running full validation. "
+                f"Reason: {exc}"
+            )
+        else:
+            with open(metrics_path, "w") as f:
+                json.dump(
+                    {
+                        "checkpoint_path": str(checkpoint_path),
+                        "val_parquet": str(config.val_parquet),
+                        "val_counts": eval_counts,
+                        "metrics": final_metrics,
+                    },
+                    f,
+                    indent=4,
+                )
+            print(f"Reused predictions: {predictions_path}")
+            print(f"Saved metrics: {metrics_path}")
+            print(
+                f"Eval complete. Pos F1={final_metrics['val_f1']:.4f}, "
+                f"P={final_metrics['val_precision']:.4f}, "
+                f"R={final_metrics['val_recall']:.4f}, "
+                f"thr={final_metrics['val_best_threshold']:.2f}"
+            )
+            return
+
     set_seed(config.seed)
     if config.gpus and torch.cuda.is_available():
         device = torch.device(f"cuda:{config.gpus[0]}")
@@ -452,32 +576,17 @@ def main():
         val_loader=val_loader,
         epoch_label="eval",
     )
-    if not val_preds:
-        raise RuntimeError("Validation produced no predictions.")
-
-    labels = np.array([int(p["label"]) for p in val_preds], dtype=np.int64)
-    probs = np.array([float(p["prob_header"]) for p in val_preds], dtype=np.float64)
-    sweep = _threshold_sweep_positive_f1(
-        labels=labels,
-        probs=probs,
-        step=config.f1_threshold_step,
+    final_metrics, eval_counts_from_preds = _finalize_metrics_from_predictions(
+        val_preds,
+        config.f1_threshold_step,
     )
-    pred_labels = sweep["pred_labels"]
-    for i, pred in enumerate(val_preds):
-        pred["pred_label"] = int(pred_labels[i])
+    final_metrics["val_loss"] = float(val_metrics_raw["val_loss"])
 
-    final_metrics = {
-        "val_loss": float(val_metrics_raw["val_loss"]),
-        "val_acc": float(sweep["acc"]),
-        "val_precision": float(sweep["pos_precision"]),
-        "val_recall": float(sweep["pos_recall"]),
-        "val_f1": float(sweep["pos_f1"]),
-        "val_auc": float(sweep["auc"]),
-        "val_weighted_precision": float(sweep["weighted_precision"]),
-        "val_weighted_recall": float(sweep["weighted_recall"]),
-        "val_weighted_f1": float(sweep["weighted_f1"]),
-        "val_best_threshold": float(sweep["threshold"]),
-    }
+    if args.save_predictions:
+        save_predictions(val_preds, predictions_path)
+        print(f"Saved predictions: {predictions_path}")
+
+    eval_counts = eval_counts_from_preds
 
     with open(metrics_path, "w") as f:
         json.dump(
@@ -491,10 +600,6 @@ def main():
             indent=4,
         )
     print(f"Saved metrics: {metrics_path}")
-
-    if args.save_predictions:
-        save_predictions(val_preds, predictions_path)
-        print(f"Saved predictions: {predictions_path}")
 
     print(
         f"Eval complete. Pos F1={final_metrics['val_f1']:.4f}, "

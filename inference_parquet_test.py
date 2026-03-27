@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 
@@ -140,6 +140,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Inference seed (default: checkpoint config or 42)",
+    )
+    parser.add_argument(
+        "--resume-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Resume from an existing output CSV by skipping row_idx values already written",
     )
     return parser.parse_args()
 
@@ -321,6 +327,24 @@ def _format_gib(kib: int) -> str:
     return f"{kib / 1024 / 1024:.2f} GiB"
 
 
+def _load_processed_row_indices(output_csv: Path) -> set[int]:
+    processed: set[int] = set()
+    with open(output_csv, "r", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None or "row_idx" not in reader.fieldnames:
+            raise RuntimeError(
+                f"Existing output CSV is missing required row_idx column: {output_csv}"
+            )
+        for row in reader:
+            if not row:
+                continue
+            row_idx_text = str(row.get("row_idx", "")).strip()
+            if not row_idx_text:
+                continue
+            processed.add(int(row_idx_text))
+    return processed
+
+
 def log_memory_snapshot(root_pid: int, *, batch_idx: int | None = None) -> None:
     main_fields = _read_kib_fields(root_pid)
     child_rows = []
@@ -424,6 +448,29 @@ def main() -> None:
         half_filters=[args.half] if args.half is not None else (),
     )
 
+    dataset_for_loader = dataset
+    existing_rows = 0
+    csv_mode = "w"
+    write_header = True
+    if args.resume_output and output_csv.exists() and output_csv.stat().st_size > 0:
+        processed_row_indices = _load_processed_row_indices(output_csv)
+        existing_rows = len(processed_row_indices)
+        remaining_indices = [
+            idx
+            for idx, row_idx in enumerate(dataset.row_indices.tolist())
+            if int(row_idx) not in processed_row_indices
+        ]
+        if not remaining_indices:
+            print(f"Existing output already covers all {len(dataset)} samples: {output_csv}")
+            return
+        dataset_for_loader = Subset(dataset, remaining_indices)
+        csv_mode = "a"
+        write_header = False
+        print(
+            "Resuming from existing output: "
+            f"{existing_rows} rows already present, {len(remaining_indices)} samples remaining."
+        )
+
     num_workers = int(args.num_workers)
     loader_kwargs = {}
     if num_workers > 0:
@@ -431,7 +478,7 @@ def main() -> None:
         loader_kwargs["prefetch_factor"] = 1
         loader_kwargs["multiprocessing_context"] = args.loader_start_method
     loader = DataLoader(
-        dataset,
+        dataset_for_loader,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -453,7 +500,7 @@ def main() -> None:
         model = torch.nn.DataParallel(model, device_ids=gpu_ids)
     model.eval()
 
-    print(f"Evaluating {len(dataset)} samples...")
+    print(f"Evaluating {len(dataset_for_loader)} samples...")
     if args.debug_memory:
         log_memory_snapshot(os.getpid())
 
@@ -470,9 +517,10 @@ def main() -> None:
     prob_header_sum = 0.0
     prob_header_sq_sum = 0.0
 
-    with open(output_csv, "w", newline="") as csv_file:
+    with open(output_csv, csv_mode, newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=csv_fieldnames)
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
 
         with torch.inference_mode():
             for batch_idx, (inputs, targets, meta) in enumerate(
@@ -522,6 +570,9 @@ def main() -> None:
     print("")
     print("Inference complete")
     print(f"Rows written:   {rows_written}")
+    if existing_rows:
+        print(f"Rows reused:    {existing_rows}")
+        print(f"Rows total:     {existing_rows + rows_written}")
     print(f"Output CSV:     {output_csv}")
     if rows_written > 0:
         mean_ph = prob_header_sum / rows_written
