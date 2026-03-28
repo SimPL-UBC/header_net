@@ -31,6 +31,7 @@ CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/output/vmae_parquet_ratio10/checkpoints/l
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/output/vmae_parquet_ratio10/test_inference}"
 OUTPUT_CSV="${OUTPUT_CSV:-}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/SoccerNet}"
+SPATIAL_MODE="${SPATIAL_MODE:-}"
 VIDEO_ID="${VIDEO_ID:-}"
 VIDEO_IDS="${VIDEO_IDS:-}"
 HALF="${HALF:-}"
@@ -106,6 +107,9 @@ COMMON_ARGS=(
 	--pin-memory "${PIN_MEMORY}"
 )
 
+if [[ -n "${SPATIAL_MODE}" ]]; then
+	COMMON_ARGS+=(--spatial-mode "${SPATIAL_MODE}")
+fi
 if [[ -n "${HALF}" ]]; then
 	COMMON_ARGS+=(--half "${HALF}")
 fi

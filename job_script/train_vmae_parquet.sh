@@ -9,6 +9,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # Env overrides:
 # TRAIN_PARQUET
 # DATASET_ROOT: path to SoccerNet root
+# SPATIAL_MODE: ball_crop|full_frame (default: ball_crop)
 # NEG_POS_RATIO: all|positive integer (e.g., 6)
 # BACKBONE_CKPT: VideoMAE checkpoint directory
 # OUTPUT_ROOT, RUN_NAME
@@ -32,25 +33,26 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 CONDA_SH="${CONDA_SH:-${HOME}/anaconda3/etc/profile.d/conda.sh}"
 if [[ ! -f "${CONDA_SH}" ]]; then
-  echo "[ERROR] Conda init not found at ${CONDA_SH}; aborting." >&2
-  exit 1
+	echo "[ERROR] Conda init not found at ${CONDA_SH}; aborting." >&2
+	exit 1
 fi
 
 # shellcheck source=/dev/null
 source "${CONDA_SH}"
 if ! conda activate deep_impact_env; then
-  echo "[ERROR] Failed to activate conda env deep_impact_env; aborting." >&2
-  exit 1
+	echo "[ERROR] Failed to activate conda env deep_impact_env; aborting." >&2
+	exit 1
 fi
 
 PYTHON_BIN="$(command -v python)"
 if [[ -z "${PYTHON_BIN}" ]]; then
-  echo "[ERROR] Python executable not found after conda activate; aborting." >&2
-  exit 1
+	echo "[ERROR] Python executable not found after conda activate; aborting." >&2
+	exit 1
 fi
 
 TRAIN_PARQUET="${TRAIN_PARQUET:-${REPO_ROOT}/output/dense_dataset/dense_train}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/SoccerNet}"
+SPATIAL_MODE="${SPATIAL_MODE:-ball_crop}"
 NEG_POS_RATIO="${NEG_POS_RATIO:-10}"
 BACKBONE_CKPT="${BACKBONE_CKPT:-${REPO_ROOT}/checkpoints/VideoMAEv2-Base}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/output/vmae_parquet_ratio10_new}"
@@ -61,8 +63,8 @@ UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-4}"
 EPOCHS="${EPOCHS:-30}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_FRAMES="${NUM_FRAMES:-16}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
-MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-2}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-4}"
 FRAME_CACHE_SIZE="${FRAME_CACHE_SIZE:-128}"
 LOADER_START_METHOD="${LOADER_START_METHOD:-spawn}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
@@ -85,40 +87,40 @@ FILTER_BAD_WINDOWS_OUTPUT_DIR="${FILTER_BAD_WINDOWS_OUTPUT_DIR:-${REPO_ROOT}/out
 FILTER_BAD_WINDOWS_CHUNK_SIZE="${FILTER_BAD_WINDOWS_CHUNK_SIZE:-200000}"
 
 if [[ "${FILTER_BAD_WINDOWS}" == "1" ]]; then
-  mkdir -p "${FILTER_BAD_WINDOWS_OUTPUT_DIR}"
+	mkdir -p "${FILTER_BAD_WINDOWS_OUTPUT_DIR}"
 
-  TRAIN_STEM="$(basename "${TRAIN_PARQUET%.parquet}")"
-  TRAIN_PARQUET_FILTERED="${FILTER_BAD_WINDOWS_OUTPUT_DIR}/${TRAIN_STEM}.valid_window_nf${NUM_FRAMES}.parquet"
-  TRAIN_FILTER_REPORT="${FILTER_BAD_WINDOWS_OUTPUT_DIR}/${TRAIN_STEM}.valid_window_nf${NUM_FRAMES}.report.csv"
+	TRAIN_STEM="$(basename "${TRAIN_PARQUET%.parquet}")"
+	TRAIN_PARQUET_FILTERED="${FILTER_BAD_WINDOWS_OUTPUT_DIR}/${TRAIN_STEM}.valid_window_nf${NUM_FRAMES}.parquet"
+	TRAIN_FILTER_REPORT="${FILTER_BAD_WINDOWS_OUTPUT_DIR}/${TRAIN_STEM}.valid_window_nf${NUM_FRAMES}.report.csv"
 
-  filter_split() {
-    local split_name="$1"
-    local input_parquet="$2"
-    local output_parquet="$3"
-    local report_csv="$4"
+	filter_split() {
+		local split_name="$1"
+		local input_parquet="$2"
+		local output_parquet="$3"
+		local report_csv="$4"
 
-    if [[ "${FILTER_BAD_WINDOWS_FORCE_REBUILD}" != "1" && -f "${output_parquet}" ]]; then
-      echo "[INFO] Reusing filtered ${split_name} parquet: ${output_parquet}"
-      return
-    fi
+		if [[ "${FILTER_BAD_WINDOWS_FORCE_REBUILD}" != "1" && -f "${output_parquet}" ]]; then
+			echo "[INFO] Reusing filtered ${split_name} parquet: ${output_parquet}"
+			return
+		fi
 
-    echo "[INFO] Filtering ${split_name} parquet windows..."
-    "${PYTHON_BIN}" "${REPO_ROOT}/tools/filter_parquet_decode_windows.py" \
-      --input-parquet "${input_parquet}" \
-      --output-parquet "${output_parquet}" \
-      --num-frames "${NUM_FRAMES}" \
-      --chunk-size "${FILTER_BAD_WINDOWS_CHUNK_SIZE}" \
-      --report-csv "${report_csv}"
-  }
+		echo "[INFO] Filtering ${split_name} parquet windows..."
+		"${PYTHON_BIN}" "${REPO_ROOT}/tools/filter_parquet_decode_windows.py" \
+			--input-parquet "${input_parquet}" \
+			--output-parquet "${output_parquet}" \
+			--num-frames "${NUM_FRAMES}" \
+			--chunk-size "${FILTER_BAD_WINDOWS_CHUNK_SIZE}" \
+			--report-csv "${report_csv}"
+	}
 
-  filter_split "train" "${TRAIN_PARQUET}" "${TRAIN_PARQUET_FILTERED}" "${TRAIN_FILTER_REPORT}"
+	filter_split "train" "${TRAIN_PARQUET}" "${TRAIN_PARQUET_FILTERED}" "${TRAIN_FILTER_REPORT}"
 
-  TRAIN_PARQUET="${TRAIN_PARQUET_FILTERED}"
+	TRAIN_PARQUET="${TRAIN_PARQUET_FILTERED}"
 fi
 
 if [[ "${VALIDATE_VIDEO_LOAD}" == "1" ]]; then
-  echo "[INFO] Validating video readability from train parquet..."
-  "${PYTHON_BIN}" - "${TRAIN_PARQUET}" "${VALIDATE_VIDEO_LOAD_MAX_ERRORS}" <<'PY'
+	echo "[INFO] Validating video readability from train parquet..."
+	"${PYTHON_BIN}" - "${TRAIN_PARQUET}" "${VALIDATE_VIDEO_LOAD_MAX_ERRORS}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -172,44 +174,45 @@ PY
 fi
 
 ARGS=(
-  -m training.cli_train_header_parquet_train
-  --train_parquet "${TRAIN_PARQUET}"
-  --dataset_root "${DATASET_ROOT}"
-  --neg_pos_ratio "${NEG_POS_RATIO}"
-  --backbone vmae
-  --finetune_mode "${FINETUNE_MODE}"
-  --unfreeze_blocks "${UNFREEZE_BLOCKS}"
-  --backbone_ckpt "${BACKBONE_CKPT}"
-  --run_name "${RUN_NAME}"
-  --output_root "${OUTPUT_ROOT}"
-  --epochs "${EPOCHS}"
-  --num_frames "${NUM_FRAMES}"
-  --batch_size "${BATCH_SIZE}"
-  --num_workers "${NUM_WORKERS}"
-  --max_open_videos "${MAX_OPEN_VIDEOS}"
-  --frame_cache_size "${FRAME_CACHE_SIZE}"
-  --loader_start_method "${LOADER_START_METHOD}"
-  --optimizer "${OPTIMIZER}"
-  --base_lr "${BASE_LR}"
-  --layer_lr_decay "${LAYER_LR_DECAY}"
-  --betas ${BETAS}
-  --weight_decay "${WEIGHT_DECAY}"
-  --loss "${LOSS}"
-  --focal_gamma "${FOCAL_GAMMA}"
-  --focal_alpha "${FOCAL_ALPHA}"
-  --save_every_n_epochs "${SAVE_EVERY_N_EPOCHS}"
-  --seed "${SEED}"
-  --gpus ${GPUS}
+	-m training.cli_train_header_parquet_train
+	--train_parquet "${TRAIN_PARQUET}"
+	--dataset_root "${DATASET_ROOT}"
+	--spatial_mode "${SPATIAL_MODE}"
+	--neg_pos_ratio "${NEG_POS_RATIO}"
+	--backbone vmae
+	--finetune_mode "${FINETUNE_MODE}"
+	--unfreeze_blocks "${UNFREEZE_BLOCKS}"
+	--backbone_ckpt "${BACKBONE_CKPT}"
+	--run_name "${RUN_NAME}"
+	--output_root "${OUTPUT_ROOT}"
+	--epochs "${EPOCHS}"
+	--num_frames "${NUM_FRAMES}"
+	--batch_size "${BATCH_SIZE}"
+	--num_workers "${NUM_WORKERS}"
+	--max_open_videos "${MAX_OPEN_VIDEOS}"
+	--frame_cache_size "${FRAME_CACHE_SIZE}"
+	--loader_start_method "${LOADER_START_METHOD}"
+	--optimizer "${OPTIMIZER}"
+	--base_lr "${BASE_LR}"
+	--layer_lr_decay "${LAYER_LR_DECAY}"
+	--betas ${BETAS}
+	--weight_decay "${WEIGHT_DECAY}"
+	--loss "${LOSS}"
+	--focal_gamma "${FOCAL_GAMMA}"
+	--focal_alpha "${FOCAL_ALPHA}"
+	--save_every_n_epochs "${SAVE_EVERY_N_EPOCHS}"
+	--seed "${SEED}"
+	--gpus ${GPUS}
 )
 
 if [[ "${SAVE_EPOCH_INDICES}" == "true" ]]; then
-  ARGS+=(--save_epoch_indices)
+	ARGS+=(--save_epoch_indices)
 else
-  ARGS+=(--no-save_epoch_indices)
+	ARGS+=(--no-save_epoch_indices)
 fi
 
 if [[ -n "${RESUME_CHECKPOINT}" ]]; then
-  ARGS+=(--resume_checkpoint "${RESUME_CHECKPOINT}")
+	ARGS+=(--resume_checkpoint "${RESUME_CHECKPOINT}")
 fi
 
 "${PYTHON_BIN}" "${ARGS[@]}"

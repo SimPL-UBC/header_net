@@ -30,6 +30,7 @@ fi
 # CHECKPOINT_PATH: checkpoint .pt to evaluate
 # VAL_PARQUET: validation parquet file or partitioned parquet dataset directory
 # DATASET_ROOT: SoccerNet root for strict path validation
+# SPATIAL_MODE: ball_crop|full_frame; empty uses checkpoint config
 # OUTPUT_DIR: optional validation output directory; empty uses checkpoint run dir
 # BATCH_SIZE, NUM_FRAMES
 # VAL_NUM_WORKERS, VAL_PIN_MEMORY, VAL_PROGRESS_EVERY
@@ -49,6 +50,7 @@ fi
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-${REPO_ROOT}/output/vmae_parquet_ratio10/checkpoints/last.pt}"
 VAL_PARQUET="${VAL_PARQUET:-${REPO_ROOT}/output/dense_dataset/dense_val}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/SoccerNet}"
+SPATIAL_MODE="${SPATIAL_MODE:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 
 BATCH_SIZE="${BATCH_SIZE:-}"
@@ -121,6 +123,9 @@ ARGS=(
 
 if [[ -n "${OUTPUT_DIR}" ]]; then
 	ARGS+=(--output_dir "${OUTPUT_DIR}")
+fi
+if [[ -n "${SPATIAL_MODE}" ]]; then
+	ARGS+=(--spatial_mode "${SPATIAL_MODE}")
 fi
 if [[ -n "${BATCH_SIZE}" ]]; then
 	ARGS+=(--batch_size "${BATCH_SIZE}")
@@ -204,6 +209,9 @@ echo "============================================================"
 echo "Checkpoint:       ${CHECKPOINT_PATH}"
 echo "Val parquet:      ${VAL_PARQUET}"
 echo "Dataset root:     ${DATASET_ROOT}"
+if [[ -n "${SPATIAL_MODE}" ]]; then
+	echo "Spatial mode:     ${SPATIAL_MODE}"
+fi
 echo "Workers:          ${VAL_NUM_WORKERS}"
 echo "Pin memory:       ${VAL_PIN_MEMORY}"
 echo "Max open videos:  ${MAX_OPEN_VIDEOS}"

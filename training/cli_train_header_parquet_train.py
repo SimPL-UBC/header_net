@@ -27,6 +27,12 @@ def parse_args():
         help="SoccerNet root directory (validated in strict path mode)",
     )
     parser.add_argument(
+        "--spatial_mode",
+        choices=("ball_crop", "full_frame"),
+        default="ball_crop",
+        help="Spatial preprocessing policy for parquet clips",
+    )
+    parser.add_argument(
         "--neg_pos_ratio",
         default="all",
         help="Train negative:positive ratio; 'all' or a positive integer",
@@ -257,6 +263,7 @@ def main():
     print(f"Starting run: {config.run_name}")
     print(f"Output directory: {run_dir}")
     print(f"Backbone: {config.backbone}")
+    print(f"Spatial mode: {config.spatial_mode}")
     print(f"Negative:positive ratio: {config.neg_pos_ratio}")
     print(
         f"Base LR scaled: {args.base_lr} * ({config.batch_size}/256) = {scaled_lr:.6g}"

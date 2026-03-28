@@ -63,6 +63,12 @@ def parse_args() -> argparse.Namespace:
         default=str(HEADER_NET_ROOT / "SoccerNet"),
         help="SoccerNet root for path validation (default: %(default)s)",
     )
+    parser.add_argument(
+        "--spatial-mode",
+        choices=("ball_crop", "full_frame"),
+        default=None,
+        help="Spatial preprocessing policy (default: checkpoint config or ball_crop)",
+    )
     parser.add_argument("--video-id", default=None, help="Optional video_id filter")
     parser.add_argument("--half", type=int, default=None, help="Optional half filter")
     parser.add_argument(
@@ -402,6 +408,9 @@ def main() -> None:
             f"inference_parquet_test.py is VMAE-only, but checkpoint backbone is '{checkpoint_backbone}'."
         )
     backbone = "vmae"
+    spatial_mode = str(
+        resolve_from_checkpoint(args.spatial_mode, checkpoint_config, "spatial_mode", "ball_crop")
+    )
     num_frames = int(resolve_from_checkpoint(args.num_frames, checkpoint_config, "num_frames", 16))
     input_size = int(resolve_from_checkpoint(args.input_size, checkpoint_config, "input_size", 224))
     batch_size = int(resolve_from_checkpoint(args.batch_size, checkpoint_config, "batch_size", 8))
@@ -417,6 +426,7 @@ def main() -> None:
     print(f"Parquet:        {parquet_path}")
     print(f"Checkpoint:     {checkpoint_path}")
     print(f"Backbone:       {backbone}")
+    print(f"Spatial mode:   {spatial_mode}")
     if backbone_ckpt is not None:
         print(f"Backbone ckpt:  {backbone_ckpt}")
     print(f"Num frames:     {num_frames}")
@@ -444,6 +454,7 @@ def main() -> None:
         frame_cache_size=int(args.frame_cache_size),
         resample_on_decode_failure=False,
         preprocess_mode=preprocess_mode,
+        spatial_mode=spatial_mode,
         video_id_filters=[args.video_id] if args.video_id else (),
         half_filters=[args.half] if args.half is not None else (),
     )

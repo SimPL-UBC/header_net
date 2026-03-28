@@ -43,6 +43,7 @@ _OPTIONAL_PARQUET_COLUMNS = [
 ]
 
 PREPROCESS_MODES = {"torchvision", "low_memory_eval"}
+SPATIAL_MODES = {"ball_crop", "full_frame"}
 
 
 def _normalize_optional_strings(values: Optional[Iterable[Union[str, int]]]) -> tuple[str, ...]:
@@ -371,6 +372,7 @@ class ParquetHeaderDataset(Dataset):
         max_resample_attempts: int = 20,
         resample_on_decode_failure: bool = True,
         preprocess_mode: str = "torchvision",
+        spatial_mode: str = "ball_crop",
         video_id_filters: Optional[Iterable[Union[str, int]]] = None,
         half_filters: Optional[Iterable[Union[str, int]]] = None,
         frame_cache_size: int = 128,
@@ -388,12 +390,18 @@ class ParquetHeaderDataset(Dataset):
         self.max_resample_attempts = max(1, int(max_resample_attempts))
         self.resample_on_decode_failure = bool(resample_on_decode_failure)
         self.preprocess_mode = str(preprocess_mode)
+        self.spatial_mode = str(spatial_mode)
         self.video_id_filters = _normalize_optional_strings(video_id_filters)
         self.half_filters = _normalize_optional_ints(half_filters)
         if self.preprocess_mode not in PREPROCESS_MODES:
             raise ValueError(
                 f"preprocess_mode must be one of {sorted(PREPROCESS_MODES)}, "
                 f"got {self.preprocess_mode!r}"
+            )
+        if self.spatial_mode not in SPATIAL_MODES:
+            raise ValueError(
+                f"spatial_mode must be one of {sorted(SPATIAL_MODES)}, "
+                f"got {self.spatial_mode!r}"
             )
         self.cropper = FrameCropper(
             crop_scale_factor=crop_scale_factor,
@@ -552,6 +560,13 @@ class ParquetHeaderDataset(Dataset):
         )
 
     def _apply_spatial_policy(self, frames: list, center_det: Optional[Dict]) -> list:
+        if self.spatial_mode == "full_frame":
+            if self._uses_low_memory_eval():
+                return [self._resize_full_frame(frame) for frame in frames]
+            return frames
+        if self.spatial_mode != "ball_crop":
+            raise RuntimeError(f"Unsupported spatial_mode: {self.spatial_mode}")
+
         # Shrink the no-ball path during inference to avoid feeding full-size
         # frames into PIL/torchvision before we downscale them anyway.
         if center_det is None:
@@ -702,6 +717,7 @@ def build_parquet_train_dataloader(config: Config):
         dataset_root=config.dataset_root,
         max_open_videos=int(getattr(config, "max_open_videos", 8)),
         frame_cache_size=int(getattr(config, "frame_cache_size", 128)),
+        spatial_mode=str(getattr(config, "spatial_mode", "ball_crop")),
         video_id_filters=getattr(config, "train_video_ids", ()),
         half_filters=getattr(config, "train_halves", ()),
     )
@@ -752,6 +768,7 @@ def build_parquet_val_dataloader(
         dataset_root=config.dataset_root,
         max_open_videos=int(getattr(config, "max_open_videos", 8)),
         frame_cache_size=int(getattr(config, "frame_cache_size", 128)),
+        spatial_mode=str(getattr(config, "spatial_mode", "ball_crop")),
         video_id_filters=getattr(config, "val_video_ids", ()),
         half_filters=getattr(config, "val_halves", ()),
     )

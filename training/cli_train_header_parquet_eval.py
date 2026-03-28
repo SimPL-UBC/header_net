@@ -31,6 +31,12 @@ def parse_args():
         help="SoccerNet root directory (validated in strict path mode)",
     )
     parser.add_argument(
+        "--spatial_mode",
+        choices=("ball_crop", "full_frame"),
+        default=None,
+        help="Spatial preprocessing policy (default: checkpoint config or ball_crop)",
+    )
+    parser.add_argument(
         "--output_dir",
         default=None,
         help="Output directory for metrics/predictions (default: checkpoint run directory)",
@@ -419,6 +425,9 @@ def main():
     config.train_halves = []
     config.val_video_ids = [str(args.video_id)] if args.video_id else []
     config.val_halves = [int(args.half)] if args.half is not None else []
+    config.spatial_mode = str(
+        _resolve(args.spatial_mode, checkpoint_config, "spatial_mode", "ball_crop")
+    )
     config.num_frames = int(_resolve(args.num_frames, checkpoint_config, "num_frames", 16))
     config.input_size = int(_resolve(None, checkpoint_config, "input_size", 224))
     config.backbone = str(_resolve(args.backbone, checkpoint_config, "backbone", "vmae"))
@@ -523,6 +532,7 @@ def main():
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Val parquet: {config.val_parquet}")
     print(f"Output directory: {output_dir}")
+    print(f"Spatial mode: {config.spatial_mode}")
     print(
         "Dataloader workers: "
         f"val={config.val_num_workers}, pin_memory={config.val_pin_memory}"

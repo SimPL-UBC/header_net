@@ -19,6 +19,7 @@ class Config:
     num_frames: int = 16  # Default to current cache value
     input_size: int = 224
     frame_sampling: str = "center"  # Phase 1: only "center" supported
+    spatial_mode: str = "ball_crop"
 
     # Model
     backbone: str = "csn"  # Phase 1: only "csn"; Phase 2: "csn" or "vmae"
@@ -80,6 +81,8 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.val_parquet = args.val_parquet
     if hasattr(args, "dataset_root"):
         config.dataset_root = args.dataset_root
+    if hasattr(args, "spatial_mode"):
+        config.spatial_mode = str(args.spatial_mode)
     if hasattr(args, "neg_pos_ratio"):
         config.neg_pos_ratio = str(args.neg_pos_ratio)
     if hasattr(args, "train_video_ids") and args.train_video_ids is not None:
