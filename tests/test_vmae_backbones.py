@@ -60,6 +60,28 @@ def test_giant_constructor_kwargs_match_checkpoint_config():
 
 
 @pytest.mark.parametrize(
+    ("default_with_cp", "override", "expected_with_cp"),
+    [
+        (False, None, False),
+        (True, None, True),
+        (False, True, True),
+        (True, False, False),
+    ],
+)
+def test_apply_vmae_runtime_overrides_respects_gradient_checkpointing(
+    default_with_cp,
+    override,
+    expected_with_cp,
+):
+    kwargs = {"with_cp": default_with_cp}
+    cfg = SimpleNamespace(gradient_checkpointing=override)
+
+    result = backbones._apply_vmae_runtime_overrides(kwargs, cfg)
+
+    assert result["with_cp"] is expected_with_cp
+
+
+@pytest.mark.parametrize(
     ("ckpt_dir", "expected_patch_size", "expected_embed_dim", "expected_depth", "expected_use_mean_pooling"),
     [
         (BASE_CKPT, 16, 768, 12, True),
@@ -83,7 +105,11 @@ def test_build_vmae_backbone_uses_checkpoint_specific_kwargs(
         lambda _path: {"model.fake_weight": torch.tensor([1.0])},
     )
 
-    cfg = SimpleNamespace(backbone_ckpt=str(ckpt_dir), num_frames=16)
+    cfg = SimpleNamespace(
+        backbone_ckpt=str(ckpt_dir),
+        num_frames=16,
+        gradient_checkpointing=None,
+    )
 
     backbone = backbones.build_vmae_backbone(cfg)
 

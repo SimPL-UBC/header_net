@@ -19,6 +19,8 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # EPOCHS, BATCH_SIZE, NUM_FRAMES, NUM_WORKERS
 # MAX_OPEN_VIDEOS, FRAME_CACHE_SIZE, LOADER_START_METHOD
 # OPTIMIZER, BASE_LR, LAYER_LR_DECAY, BETAS, WEIGHT_DECAY
+# AMP: true|false (default: false)
+# GRADIENT_CHECKPOINTING: true|false (default: false)
 # LOSS, FOCAL_GAMMA, FOCAL_ALPHA
 # SEED, GPUS
 # SAVE_EPOCH_INDICES: true|false
@@ -72,6 +74,8 @@ BASE_LR="${BASE_LR:-1e-3}"
 LAYER_LR_DECAY="${LAYER_LR_DECAY:-0.75}"
 BETAS="${BETAS:-0.9 0.999}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
+AMP="${AMP:-false}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-false}"
 LOSS="${LOSS:-focal}"
 FOCAL_GAMMA="${FOCAL_GAMMA:-2.0}"
 FOCAL_ALPHA="${FOCAL_ALPHA:-0.75}"
@@ -173,6 +177,20 @@ print("[INFO] Video readability check passed.")
 PY
 fi
 
+is_enabled() {
+	case "$1" in
+	1|true|TRUE|on|ON|yes|YES)
+		return 0
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+echo "[INFO] AMP=${AMP}"
+echo "[INFO] GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING}"
+
 ARGS=(
 	-m training.cli_train_header_parquet_train
 	--train_parquet "${TRAIN_PARQUET}"
@@ -204,6 +222,18 @@ ARGS=(
 	--seed "${SEED}"
 	--gpus ${GPUS}
 )
+
+if is_enabled "${AMP}"; then
+	ARGS+=(--amp)
+else
+	ARGS+=(--no-amp)
+fi
+
+if is_enabled "${GRADIENT_CHECKPOINTING}"; then
+	ARGS+=(--gradient_checkpointing)
+else
+	ARGS+=(--no-gradient_checkpointing)
+fi
 
 if [[ "${SAVE_EPOCH_INDICES}" == "true" ]]; then
 	ARGS+=(--save_epoch_indices)

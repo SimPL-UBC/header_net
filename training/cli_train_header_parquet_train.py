@@ -6,10 +6,6 @@ import numpy as np
 import torch
 
 from .config import merge_cli_args
-from .data.parquet_header_dataset import build_parquet_train_dataloader
-from .engine.supervised_trainer import Trainer
-from .models.factory import build_model
-from .run_utils import create_run_dir, save_config, set_seed
 
 
 def parse_args():
@@ -74,6 +70,15 @@ def parse_args():
         default=None,
         help="Path to VideoMAE checkpoint directory",
     )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override VideoMAE gradient checkpointing (with_cp). "
+            "Default uses the checkpoint config."
+        ),
+    )
     parser.add_argument("--run_name", required=True, help="Run name")
     parser.add_argument("--output_root", default="output/vmae", help="Output root")
     parser.add_argument(
@@ -124,6 +129,12 @@ def parse_args():
         help="AdamW betas",
     )
     parser.add_argument("--weight_decay", type=float, default=0.05, help="Weight decay")
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable CUDA automatic mixed precision training",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--num_frames", type=int, default=16, help="Number of frames per clip"
@@ -178,19 +189,20 @@ def _validate_optional_ratio(value, arg_name):
         raise ValueError(f"{arg_name} must be 'all' or a positive integer.")
 
 
-def _save_checkpoint(model, optimizer, args, path, epoch):
+def _save_checkpoint(model, optimizer, args, path, epoch, scaler=None):
     checkpoint_model = _checkpoint_model(model)
     state_dict = checkpoint_model.state_dict()
 
-    torch.save(
-        {
-            "epoch": int(epoch),
-            "state_dict": state_dict,
-            "optimizer_state": optimizer.state_dict(),
-            "config": vars(args),
-        },
-        path,
-    )
+    checkpoint = {
+        "epoch": int(epoch),
+        "state_dict": state_dict,
+        "optimizer_state": optimizer.state_dict(),
+        "config": vars(args),
+    }
+    if scaler is not None:
+        checkpoint["scaler_state"] = scaler.state_dict()
+
+    torch.save(checkpoint, path)
 
 
 def _checkpoint_model(model):
@@ -206,7 +218,7 @@ def _move_optimizer_state_to_device(optimizer, device):
                 state[key] = value.to(device)
 
 
-def _load_resume_checkpoint(model, optimizer, checkpoint_path, device):
+def _load_resume_checkpoint(model, optimizer, checkpoint_path, device, scaler=None):
     resume_path = Path(checkpoint_path)
     if not resume_path.exists():
         raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
@@ -228,6 +240,8 @@ def _load_resume_checkpoint(model, optimizer, checkpoint_path, device):
         )
     optimizer.load_state_dict(optimizer_state)
     _move_optimizer_state_to_device(optimizer, device)
+    if scaler is not None and "scaler_state" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler_state"])
 
     completed_epoch = int(checkpoint.get("epoch", 0))
     return resume_path, completed_epoch
@@ -245,6 +259,11 @@ def _ensure_metrics_file(metrics_path, append=False):
 
 
 def main():
+    from .data.parquet_header_dataset import build_parquet_train_dataloader
+    from .engine.supervised_trainer import Trainer
+    from .models.factory import build_model
+    from .run_utils import create_run_dir, save_config, set_seed
+
     args = parse_args()
     config = merge_cli_args(args)
 
@@ -274,6 +293,11 @@ def main():
         f"max_open_videos={config.max_open_videos}, "
         f"frame_cache_size={config.frame_cache_size}, "
         f"start_method={config.loader_start_method}"
+    )
+    print(f"AMP: {config.amp}")
+    print(
+        "Gradient checkpointing override: "
+        f"{config.gradient_checkpointing if config.gradient_checkpointing is not None else 'checkpoint_default'}"
     )
     print(f"Save checkpoint every N epochs: {config.save_every_n_epochs}")
 
@@ -326,6 +350,7 @@ def main():
             optimizer,
             args.resume_checkpoint,
             device,
+            trainer.scaler,
         )
         start_epoch = completed_epoch + 1
         if start_epoch > config.epochs:
@@ -374,7 +399,7 @@ def main():
         if epoch % int(config.save_every_n_epochs) == 0:
             checkpoint_name = f"epoch_{epoch:03d}.pt"
             checkpoint_path = run_dir / "checkpoints" / checkpoint_name
-            _save_checkpoint(model, optimizer, args, checkpoint_path, epoch)
+            _save_checkpoint(model, optimizer, args, checkpoint_path, epoch, trainer.scaler)
             checkpoint_rel = f"checkpoints/{checkpoint_name}"
             print(f"Saved periodic checkpoint: {checkpoint_path}")
 
@@ -388,7 +413,7 @@ def main():
             )
 
     final_checkpoint_path = run_dir / "checkpoints" / "last.pt"
-    _save_checkpoint(model, optimizer, args, final_checkpoint_path, last_epoch)
+    _save_checkpoint(model, optimizer, args, final_checkpoint_path, last_epoch, trainer.scaler)
     print(f"Saved final checkpoint: {final_checkpoint_path}")
 
     with open(artifacts_path, "w") as f:

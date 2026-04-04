@@ -26,6 +26,7 @@ class Config:
     finetune_mode: str = "full"  # Phase 1: only "full"; Phase 2: "full" or "frozen"; Phase 3: add "partial"
     unfreeze_blocks: int = 4  # Number of last transformer blocks to unfreeze for VideoMAE partial fine-tuning
     backbone_ckpt: Optional[str] = None  # Path to VideoMAE checkpoint
+    gradient_checkpointing: Optional[bool] = None  # Runtime override for VideoMAE with_cp
 
     # Optimization
     optimizer_type: str = "adamw"
@@ -53,6 +54,7 @@ class Config:
     output_root: str = "report/header_experiments"
     gpus: Optional[List[int]] = None
     layer_lr_decay: float = 0.75
+    amp: bool = False
     f1_threshold_step: float = 0.01
     save_epoch_indices: bool = True
     save_every_n_epochs: int = 1
@@ -103,6 +105,8 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.unfreeze_blocks = args.unfreeze_blocks
     if hasattr(args, "backbone_ckpt"):
         config.backbone_ckpt = args.backbone_ckpt
+    if hasattr(args, "gradient_checkpointing"):
+        config.gradient_checkpointing = args.gradient_checkpointing
 
     # Optimization
     if hasattr(args, "lr_backbone"):
@@ -145,6 +149,8 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.num_frames = args.num_frames
     if hasattr(args, "layer_lr_decay"):
         config.layer_lr_decay = args.layer_lr_decay
+    if hasattr(args, "amp"):
+        config.amp = args.amp
     if hasattr(args, "loss"):
         config.loss_type = args.loss
     if hasattr(args, "focal_gamma"):

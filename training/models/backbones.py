@@ -109,6 +109,13 @@ def _build_vmae_constructor_kwargs(model_config: dict, num_frames: int) -> dict:
     return kwargs
 
 
+def _apply_vmae_runtime_overrides(model_kwargs: dict, config) -> dict:
+    override = getattr(config, "gradient_checkpointing", None)
+    if override is not None:
+        model_kwargs["with_cp"] = bool(override)
+    return model_kwargs
+
+
 def _module_cache_key(prefix: str, path: Path) -> str:
     digest = hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
     return f"_header_net_{prefix}_{digest}"
@@ -173,6 +180,7 @@ def build_vmae_backbone(config):
     ckpt_dir = _resolve_vmae_checkpoint_dir(config)
     model_config = _load_vmae_model_config(ckpt_dir)
     model_kwargs = _build_vmae_constructor_kwargs(model_config, config.num_frames)
+    model_kwargs = _apply_vmae_runtime_overrides(model_kwargs, config)
     modeling_videomaev2 = _load_vmae_checkpoint_module(ckpt_dir)
 
     vision_transformer_cls = getattr(modeling_videomaev2, "VisionTransformer", None)
@@ -190,6 +198,7 @@ def build_vmae_backbone(config):
         f"depth={model_kwargs['depth']}, "
         f"num_heads={model_kwargs['num_heads']}, "
         f"use_mean_pooling={model_kwargs['use_mean_pooling']}, "
+        f"with_cp={model_kwargs['with_cp']}, "
         f"num_frames={model_kwargs['num_frames']}"
     )
 

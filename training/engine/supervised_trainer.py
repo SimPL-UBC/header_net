@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,6 +48,10 @@ class Trainer:
     def __init__(self, config, device):
         self.config = config
         self.device = device
+        self.amp_enabled = bool(getattr(config, "amp", False) and device.type == "cuda")
+        self.scaler = None
+        if device.type == "cuda":
+            self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
         if getattr(config, "loss_type", "focal") == "focal":
             self.criterion = FocalLoss(
                 gamma=getattr(config, "focal_gamma", 2.0),
@@ -53,6 +59,11 @@ class Trainer:
             )
         else:
             self.criterion = nn.CrossEntropyLoss()
+
+    def _autocast_context(self):
+        if not self.amp_enabled:
+            return nullcontext()
+        return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
 
     def _per_sample_loss(self, logits, targets):
         if getattr(self.config, "loss_type", "focal") == "focal":
@@ -85,13 +96,21 @@ class Trainer:
             targets = targets.to(self.device)
             
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = self.criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            with self._autocast_context():
+                outputs = model(inputs)
+                loss = self.criterion(outputs, targets)
+
+            if self.scaler is not None and self.amp_enabled:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             
             running_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs, 1)
+            outputs_for_metrics = outputs.detach().float()
+            _, predicted = torch.max(outputs_for_metrics, 1)
             total += targets.size(0)
             correct += (predicted == targets).sum().item()
             all_preds.extend(predicted.detach().cpu().numpy())
@@ -126,12 +145,14 @@ class Trainer:
             for batch_idx, (inputs, targets, meta) in enumerate(val_loader, start=1):
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
-                
-                outputs = model(inputs)
-                sample_losses = self._per_sample_loss(outputs, targets)
+
+                with self._autocast_context():
+                    outputs = model(inputs)
+                    sample_losses = self._per_sample_loss(outputs, targets)
                 running_loss += sample_losses.sum().item()
-                
-                probs = F.softmax(outputs, dim=1)
+
+                outputs_for_metrics = outputs.float()
+                probs = F.softmax(outputs_for_metrics, dim=1)
                 _, preds = torch.max(outputs, 1)
                 
                 all_preds.extend(preds.cpu().numpy())
