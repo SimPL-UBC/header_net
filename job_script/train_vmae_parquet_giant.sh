@@ -11,7 +11,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # DATASET_ROOT: path to SoccerNet root
 # SPATIAL_MODE: ball_crop|full_frame (default: ball_crop)
 # NEG_POS_RATIO: all|positive integer (e.g., 6)
-# BACKBONE_CKPT: VideoMAE checkpoint directory (Base/Large/Giant; selects architecture)
+# BACKBONE_CKPT: VideoMAE checkpoint directory (default: Giant)
 # OUTPUT_ROOT, RUN_NAME
 # RESUME_CHECKPOINT: optional periodic checkpoint path (e.g. output/vmae/<run>/checkpoints/epoch_014.pt)
 # FINETUNE_MODE: full|frozen|partial
@@ -54,17 +54,17 @@ TRAIN_PARQUET="${TRAIN_PARQUET:-${REPO_ROOT}/output/dense_dataset/dense_train}"
 DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/SoccerNet}"
 SPATIAL_MODE="${SPATIAL_MODE:-ball_crop}"
 NEG_POS_RATIO="${NEG_POS_RATIO:-10}"
-BACKBONE_CKPT="${BACKBONE_CKPT:-${REPO_ROOT}/checkpoints/VideoMAEv2-Base}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/output/vmae_parquet_ratio10_new}"
-RUN_NAME="${RUN_NAME:-vmae_parquet_ratio10_new}"
+BACKBONE_CKPT="${BACKBONE_CKPT:-${REPO_ROOT}/checkpoints/VideoMAEv2-giant}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/output/vmae_parquet_ratio10_new_giant}"
+RUN_NAME="${RUN_NAME:-vmae_parquet_ratio10_new_giant}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 FINETUNE_MODE="${FINETUNE_MODE:-full}"
 UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-4}"
 EPOCHS="${EPOCHS:-30}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 NUM_FRAMES="${NUM_FRAMES:-16}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
-MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-4}"
+NUM_WORKERS="${NUM_WORKERS:-2}"
+MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-2}"
 FRAME_CACHE_SIZE="${FRAME_CACHE_SIZE:-128}"
 LOADER_START_METHOD="${LOADER_START_METHOD:-spawn}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
