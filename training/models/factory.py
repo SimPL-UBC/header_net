@@ -4,6 +4,10 @@ from .backbones import build_csn_backbone, build_vmae_backbone
 from .heads import VideoMAEHead
 
 
+def _should_log(config: Config) -> bool:
+    return bool(getattr(config, "is_main_process", True))
+
+
 class VideoMAEModel(nn.Module):
     """Combined VideoMAE backbone + classification head."""
     
@@ -111,7 +115,10 @@ def build_model(config: Config):
             param_groups = _build_vmae_param_groups(
                 backbone, head, config.base_lr, config.layer_lr_decay
             )
-            print(f"VideoMAE backbone frozen. Training only head with lr={config.base_lr}")
+            if _should_log(config):
+                print(
+                    f"VideoMAE backbone frozen. Training only head with lr={config.base_lr}"
+                )
             
         elif config.finetune_mode == "partial":
             if config.unfreeze_blocks < 0:
@@ -133,11 +140,12 @@ def build_model(config: Config):
             param_groups = _build_vmae_param_groups(
                 backbone, head, config.base_lr, config.layer_lr_decay
             )
-            print(
-                "VideoMAE partial fine-tuning: "
-                f"unfreeze_blocks={num_unfreeze}/{num_blocks}, "
-                f"base lr={config.base_lr}, layer decay={config.layer_lr_decay}"
-            )
+            if _should_log(config):
+                print(
+                    "VideoMAE partial fine-tuning: "
+                    f"unfreeze_blocks={num_unfreeze}/{num_blocks}, "
+                    f"base lr={config.base_lr}, layer decay={config.layer_lr_decay}"
+                )
 
         elif config.finetune_mode == "full":
             # Train both backbone and head (Phase 3)
@@ -146,10 +154,11 @@ def build_model(config: Config):
             param_groups = _build_vmae_param_groups(
                 backbone, head, config.base_lr, config.layer_lr_decay
             )
-            print(
-                f"VideoMAE full fine-tuning: base lr={config.base_lr}, "
-                f"layer decay={config.layer_lr_decay}"
-            )
+            if _should_log(config):
+                print(
+                    f"VideoMAE full fine-tuning: base lr={config.base_lr}, "
+                    f"layer decay={config.layer_lr_decay}"
+                )
         else:
             raise ValueError(f"Unsupported finetune_mode for vmae: {config.finetune_mode}")
     else:

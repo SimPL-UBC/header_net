@@ -274,6 +274,8 @@ class DeterministicRatioSampler(Sampler[int]):
         shuffle: bool = True,
         group_codes: Optional[np.ndarray] = None,
         order_values: Optional[np.ndarray] = None,
+        num_replicas: int = 1,
+        rank: int = 0,
     ):
         self.positive_indices = np.asarray(positive_indices, dtype=np.int64)
         self.negative_indices = np.asarray(negative_indices, dtype=np.int64)
@@ -286,8 +288,17 @@ class DeterministicRatioSampler(Sampler[int]):
         self.order_values = (
             np.asarray(order_values, dtype=np.int64) if order_values is not None else None
         )
+        self.num_replicas = max(1, int(num_replicas))
+        self.rank = int(rank)
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError(
+                f"rank must be in [0, {self.num_replicas - 1}], got {self.rank}"
+            )
         self.current_epoch = 0
+        self._global_indices = np.array([], dtype=np.int64)
         self._indices = np.array([], dtype=np.int64)
+        self._sample_count = 0
+        self._negative_sample_count = 0
         self.set_epoch(0)
 
     def _order_indices(
@@ -332,11 +343,27 @@ class DeterministicRatioSampler(Sampler[int]):
             else:
                 neg = np.array([], dtype=np.int64)
 
-        indices = np.concatenate([self.positive_indices, neg])
-        self._indices = self._order_indices(
-            indices.astype(np.int64, copy=False),
+        indices = np.concatenate([self.positive_indices, neg]).astype(np.int64, copy=False)
+        self._global_indices = self._order_indices(
+            indices,
             rng,
         )
+        self._sample_count = int(len(self._global_indices))
+        self._negative_sample_count = int(self._sample_count - len(self.positive_indices))
+        self._indices = self._shard_indices(self._global_indices)
+
+    def _shard_indices(self, global_indices: np.ndarray) -> np.ndarray:
+        if self.num_replicas == 1:
+            return global_indices.copy()
+        if len(global_indices) == 0:
+            return np.array([], dtype=np.int64)
+
+        pad_size = (-len(global_indices)) % self.num_replicas
+        if pad_size > 0:
+            padded = np.concatenate([global_indices, global_indices[:pad_size]])
+        else:
+            padded = global_indices
+        return padded[self.rank :: self.num_replicas].astype(np.int64, copy=False)
 
     def __iter__(self):
         return iter(self._indices.tolist())
@@ -347,13 +374,14 @@ class DeterministicRatioSampler(Sampler[int]):
     def get_indices(self) -> np.ndarray:
         return self._indices.copy()
 
+    def get_global_indices(self) -> np.ndarray:
+        return self._global_indices.copy()
+
     def get_counts(self) -> Dict[str, int]:
-        pos_count = int(len(self.positive_indices))
-        neg_count = int(len(self._indices) - pos_count)
         return {
-            "samples": int(len(self._indices)),
-            "positives": pos_count,
-            "negatives": neg_count,
+            "samples": self._sample_count,
+            "positives": int(len(self.positive_indices)),
+            "negatives": self._negative_sample_count,
         }
 
 
@@ -706,7 +734,12 @@ def _dataloader_kwargs(num_workers: int, config: Config) -> Dict[str, object]:
     return kwargs
 
 
-def build_parquet_train_dataloader(config: Config):
+def build_parquet_train_dataloader(
+    config: Config,
+    *,
+    num_replicas: int = 1,
+    rank: int = 0,
+):
     train_transform = get_transforms(config.input_size, is_training=True)
     train_dataset = ParquetHeaderDataset(
         parquet_path=config.train_parquet,
@@ -733,9 +766,11 @@ def build_parquet_train_dataloader(config: Config):
         shuffle=True,
         group_codes=train_dataset.sample_group_codes,
         order_values=train_dataset.sample_order_values,
+        num_replicas=num_replicas,
+        rank=rank,
     )
 
-    generator = _build_torch_generator(config.seed)
+    generator = _build_torch_generator(int(config.seed) + int(rank))
     num_workers = int(getattr(config, "num_workers", 0))
     train_loader = DataLoader(
         train_dataset,

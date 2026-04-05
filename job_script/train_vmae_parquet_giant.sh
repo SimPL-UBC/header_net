@@ -16,13 +16,13 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # RESUME_CHECKPOINT: optional periodic checkpoint path (e.g. output/vmae/<run>/checkpoints/epoch_014.pt)
 # FINETUNE_MODE: full|frozen|partial
 # UNFREEZE_BLOCKS
-# EPOCHS, BATCH_SIZE, NUM_FRAMES, NUM_WORKERS
+# EPOCHS, BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS, NUM_FRAMES, NUM_WORKERS
 # MAX_OPEN_VIDEOS, FRAME_CACHE_SIZE, LOADER_START_METHOD
 # OPTIMIZER, BASE_LR, LAYER_LR_DECAY, BETAS, WEIGHT_DECAY
-# AMP: true|false (default: false)
-# GRADIENT_CHECKPOINTING: true|false (default: false)
+# AMP: true|false (default: true)
+# GRADIENT_CHECKPOINTING: true|false (default: true)
 # LOSS, FOCAL_GAMMA, FOCAL_ALPHA
-# SEED, GPUS
+# SEED, GPUS, USE_DDP
 # SAVE_EPOCH_INDICES: true|false
 # SAVE_EVERY_N_EPOCHS: save periodic checkpoints every N epochs (default: 1)
 # VALIDATE_VIDEO_LOAD: 1 to verify train parquet video paths can be opened/decoded before training (default: 1)
@@ -63,10 +63,11 @@ RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 FINETUNE_MODE="${FINETUNE_MODE:-full}"
 UNFREEZE_BLOCKS="${UNFREEZE_BLOCKS:-4}"
 EPOCHS="${EPOCHS:-30}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
 NUM_FRAMES="${NUM_FRAMES:-16}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
-MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-2}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
+MAX_OPEN_VIDEOS="${MAX_OPEN_VIDEOS:-1}"
 FRAME_CACHE_SIZE="${FRAME_CACHE_SIZE:-128}"
 LOADER_START_METHOD="${LOADER_START_METHOD:-spawn}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
@@ -74,13 +75,14 @@ BASE_LR="${BASE_LR:-1e-3}"
 LAYER_LR_DECAY="${LAYER_LR_DECAY:-0.75}"
 BETAS="${BETAS:-0.9 0.999}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
-AMP="${AMP:-false}"
-GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-false}"
+AMP="${AMP:-true}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 LOSS="${LOSS:-focal}"
 FOCAL_GAMMA="${FOCAL_GAMMA:-2.0}"
 FOCAL_ALPHA="${FOCAL_ALPHA:-0.75}"
 SEED="${SEED:-42}"
 GPUS="${GPUS:-0 1}"
+USE_DDP="${USE_DDP:-true}"
 SAVE_EPOCH_INDICES="${SAVE_EPOCH_INDICES:-true}"
 SAVE_EVERY_N_EPOCHS="${SAVE_EVERY_N_EPOCHS:-1}"
 VALIDATE_VIDEO_LOAD="${VALIDATE_VIDEO_LOAD:-1}"
@@ -190,6 +192,16 @@ is_enabled() {
 
 echo "[INFO] AMP=${AMP}"
 echo "[INFO] GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING}"
+echo "[INFO] BATCH_SIZE=${BATCH_SIZE}"
+echo "[INFO] GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS}"
+echo "[INFO] USE_DDP=${USE_DDP}"
+
+NORMALIZED_GPUS="${GPUS//,/ }"
+read -r -a GPU_LIST <<<"${NORMALIZED_GPUS}"
+if [[ ${#GPU_LIST[@]} -eq 0 ]]; then
+	GPU_LIST=(0)
+fi
+echo "[INFO] GPUS=${GPU_LIST[*]}"
 
 ARGS=(
 	-m training.cli_train_header_parquet_train
@@ -206,6 +218,7 @@ ARGS=(
 	--epochs "${EPOCHS}"
 	--num_frames "${NUM_FRAMES}"
 	--batch_size "${BATCH_SIZE}"
+	--gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
 	--num_workers "${NUM_WORKERS}"
 	--max_open_videos "${MAX_OPEN_VIDEOS}"
 	--frame_cache_size "${FRAME_CACHE_SIZE}"
@@ -220,7 +233,7 @@ ARGS=(
 	--focal_alpha "${FOCAL_ALPHA}"
 	--save_every_n_epochs "${SAVE_EVERY_N_EPOCHS}"
 	--seed "${SEED}"
-	--gpus ${GPUS}
+	--gpus "${GPU_LIST[@]}"
 )
 
 if is_enabled "${AMP}"; then
@@ -245,4 +258,18 @@ if [[ -n "${RESUME_CHECKPOINT}" ]]; then
 	ARGS+=(--resume_checkpoint "${RESUME_CHECKPOINT}")
 fi
 
-"${PYTHON_BIN}" "${ARGS[@]}"
+if is_enabled "${USE_DDP}" && [[ ${#GPU_LIST[@]} -gt 1 ]]; then
+	CUDA_VISIBLE_DEVICES_VALUE="$(IFS=,; echo "${GPU_LIST[*]}")"
+	if command -v torchrun >/dev/null 2>&1; then
+		LAUNCH_CMD=(torchrun --standalone --nproc_per_node "${#GPU_LIST[@]}")
+	else
+		LAUNCH_CMD=("${PYTHON_BIN}" -m torch.distributed.run --standalone --nproc_per_node "${#GPU_LIST[@]}")
+	fi
+	echo "[INFO] Launching DDP across ${#GPU_LIST[@]} GPU(s)"
+	CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES_VALUE}" "${LAUNCH_CMD[@]}" "${ARGS[@]}"
+else
+	if is_enabled "${USE_DDP}" && [[ ${#GPU_LIST[@]} -le 1 ]]; then
+		echo "[INFO] USE_DDP requested with ${#GPU_LIST[@]} visible GPU; running single-process."
+	fi
+	"${PYTHON_BIN}" "${ARGS[@]}"
+fi

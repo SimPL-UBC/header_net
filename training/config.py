@@ -37,6 +37,7 @@ class Config:
     weight_decay: float = 0.05
     epochs: int = 50
     batch_size: int = 16
+    gradient_accumulation_steps: int = 1
     num_workers: int = 8
     val_num_workers: int = 0
     max_open_videos: int = 8
@@ -125,6 +126,8 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.epochs = args.epochs
     if hasattr(args, "batch_size"):
         config.batch_size = args.batch_size
+    if hasattr(args, "gradient_accumulation_steps"):
+        config.gradient_accumulation_steps = args.gradient_accumulation_steps
     if hasattr(args, "num_workers"):
         config.num_workers = args.num_workers
     if hasattr(args, "val_num_workers"):

@@ -116,6 +116,10 @@ def _apply_vmae_runtime_overrides(model_kwargs: dict, config) -> dict:
     return model_kwargs
 
 
+def _should_log(config) -> bool:
+    return bool(getattr(config, "is_main_process", True))
+
+
 def _module_cache_key(prefix: str, path: Path) -> str:
     digest = hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
     return f"_header_net_{prefix}_{digest}"
@@ -190,17 +194,18 @@ def build_vmae_backbone(config):
         )
 
     hidden_dim = int(model_config["embed_dim"])
-    print(
-        "Resolved VideoMAE backbone: "
-        f"checkpoint={ckpt_dir}, "
-        f"patch_size={model_kwargs['patch_size']}, "
-        f"embed_dim={hidden_dim}, "
-        f"depth={model_kwargs['depth']}, "
-        f"num_heads={model_kwargs['num_heads']}, "
-        f"use_mean_pooling={model_kwargs['use_mean_pooling']}, "
-        f"with_cp={model_kwargs['with_cp']}, "
-        f"num_frames={model_kwargs['num_frames']}"
-    )
+    if _should_log(config):
+        print(
+            "Resolved VideoMAE backbone: "
+            f"checkpoint={ckpt_dir}, "
+            f"patch_size={model_kwargs['patch_size']}, "
+            f"embed_dim={hidden_dim}, "
+            f"depth={model_kwargs['depth']}, "
+            f"num_heads={model_kwargs['num_heads']}, "
+            f"use_mean_pooling={model_kwargs['use_mean_pooling']}, "
+            f"with_cp={model_kwargs['with_cp']}, "
+            f"num_frames={model_kwargs['num_frames']}"
+        )
 
     model = vision_transformer_cls(**model_kwargs)
     
@@ -222,12 +227,17 @@ def build_vmae_backbone(config):
         else:
             missing = getattr(load_result, "missing_keys", [])
             unexpected = getattr(load_result, "unexpected_keys", [])
-        print(f"Loaded VideoMAE checkpoint from {safetensors_path}")
-        if missing:
-            print(f"Missing keys: {len(missing)} total")
-        if unexpected:
-            print(f"Unexpected keys: {len(unexpected)} total")
+        if _should_log(config):
+            print(f"Loaded VideoMAE checkpoint from {safetensors_path}")
+            if missing:
+                print(f"Missing keys: {len(missing)} total")
+            if unexpected:
+                print(f"Unexpected keys: {len(unexpected)} total")
     else:
-        print(f"Warning: No safetensors checkpoint found at {safetensors_path}, using random initialization")
+        if _should_log(config):
+            print(
+                f"Warning: No safetensors checkpoint found at {safetensors_path}, "
+                "using random initialization"
+            )
     
     return VideoMAEBackbone(model, hidden_dim)

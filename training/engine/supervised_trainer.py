@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import time
-from sklearn.metrics import f1_score
 from tqdm import tqdm
 from ..eval.metrics import compute_classification_metrics
 
@@ -48,6 +47,9 @@ class Trainer:
     def __init__(self, config, device):
         self.config = config
         self.device = device
+        self.gradient_accumulation_steps = max(
+            1, int(getattr(config, "gradient_accumulation_steps", 1))
+        )
         self.amp_enabled = bool(getattr(config, "amp", False) and device.type == "cuda")
         self.scaler = None
         if device.type == "cuda":
@@ -59,6 +61,13 @@ class Trainer:
             )
         else:
             self.criterion = nn.CrossEntropyLoss()
+
+    @staticmethod
+    def _binary_f1(tp: int, fp: int, fn: int) -> float:
+        denominator = (2 * tp) + fp + fn
+        if denominator <= 0:
+            return 0.0
+        return (2.0 * tp) / float(denominator)
 
     def _autocast_context(self):
         if not self.amp_enabled:
@@ -76,11 +85,12 @@ class Trainer:
 
     def train_one_epoch(self, model, train_loader, optimizer, epoch):
         model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        all_preds = []
-        all_labels = []
+        loss_sum = 0.0
+        sample_count = 0
+        tp = 0
+        fp = 0
+        fn = 0
+        tn = 0
 
         progress = tqdm(
             train_loader,
@@ -88,47 +98,89 @@ class Trainer:
             unit="batch",
             dynamic_ncols=True,
             leave=False,
+            disable=not bool(getattr(self.config, "is_main_process", True)),
         )
 
         # train_loader yields (inputs, targets, meta)
-        for inputs, targets, _ in progress:
+        optimizer.zero_grad(set_to_none=True)
+        pending_microbatches = 0
+        total_batches = len(train_loader) if hasattr(train_loader, "__len__") else None
+        for batch_idx, (inputs, targets, _) in enumerate(progress, start=1):
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
-            
-            optimizer.zero_grad()
-            with self._autocast_context():
-                outputs = model(inputs)
-                loss = self.criterion(outputs, targets)
 
+            should_step = pending_microbatches + 1 == self.gradient_accumulation_steps
+            is_last_batch = total_batches is not None and batch_idx == total_batches
+            should_sync = should_step or is_last_batch or total_batches is None
+            sync_context = nullcontext()
+            if not should_sync and hasattr(model, "no_sync"):
+                sync_context = model.no_sync()
+
+            with sync_context:
+                with self._autocast_context():
+                    outputs = model(inputs)
+                    loss = self.criterion(outputs, targets)
+                loss_for_backward = loss / self.gradient_accumulation_steps
+
+                if self.scaler is not None and self.amp_enabled:
+                    self.scaler.scale(loss_for_backward).backward()
+                else:
+                    loss_for_backward.backward()
+
+            pending_microbatches += 1
+            if pending_microbatches == self.gradient_accumulation_steps:
+                if self.scaler is not None and self.amp_enabled:
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                pending_microbatches = 0
+
+            loss_sum += loss.item() * inputs.size(0)
+            outputs_for_metrics = outputs.detach().float()
+            _, predicted = torch.max(outputs_for_metrics, 1)
+            sample_count += targets.size(0)
+            predicted_positive = predicted.eq(1)
+            target_positive = targets.eq(1)
+            tp += int((predicted_positive & target_positive).sum().item())
+            fp += int((predicted_positive & ~target_positive).sum().item())
+            fn += int((~predicted_positive & target_positive).sum().item())
+            tn += int((~predicted_positive & ~target_positive).sum().item())
+
+            if sample_count > 0:
+                correct = tp + tn
+                progress.set_postfix(
+                    loss=f"{loss_sum / sample_count:.4f}",
+                    acc=f"{correct / sample_count:.4f}",
+                    f1=f"{self._binary_f1(tp, fp, fn):.4f}",
+                    refresh=False,
+                )
+
+        if pending_microbatches > 0:
             if self.scaler is not None and self.amp_enabled:
-                self.scaler.scale(loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
             else:
-                loss.backward()
                 optimizer.step()
-            
-            running_loss += loss.item() * inputs.size(0)
-            outputs_for_metrics = outputs.detach().float()
-            _, predicted = torch.max(outputs_for_metrics, 1)
-            total += targets.size(0)
-            correct += (predicted == targets).sum().item()
-            all_preds.extend(predicted.detach().cpu().numpy())
-            all_labels.extend(targets.detach().cpu().numpy())
+            optimizer.zero_grad(set_to_none=True)
 
-            if total > 0:
-                progress.set_postfix(
-                    loss=f"{running_loss / total:.4f}",
-                    acc=f"{correct / total:.4f}",
-                    f1=f"{f1_score(all_labels, all_preds, zero_division=0):.4f}",
-                    refresh=False,
-                )
-            
-        epoch_loss = running_loss / total if total > 0 else 0.0
-        epoch_acc = correct / total if total > 0 else 0.0
-        train_f1 = f1_score(all_labels, all_preds, zero_division=0) if total > 0 else 0.0
-        
-        return {"train_loss": epoch_loss, "train_acc": epoch_acc, "train_f1": train_f1}
+        correct = tp + tn
+        epoch_loss = loss_sum / sample_count if sample_count > 0 else 0.0
+        epoch_acc = correct / sample_count if sample_count > 0 else 0.0
+        train_f1 = self._binary_f1(tp, fp, fn)
+
+        return {
+            "loss_sum": float(loss_sum),
+            "sample_count": int(sample_count),
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tn": int(tn),
+            "train_loss": epoch_loss,
+            "train_acc": epoch_acc,
+            "train_f1": train_f1,
+        }
 
     def validate(self, model, val_loader, epoch):
         model.eval()
