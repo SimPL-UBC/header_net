@@ -3,12 +3,16 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import random
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
 from .config import merge_cli_args
+
+
+LATEST_CHECKPOINT_MANIFEST = "latest_train_checkpoint.json"
 
 
 @dataclass(frozen=True)
@@ -99,7 +103,7 @@ def parse_args():
     parser.add_argument(
         "--resume_checkpoint",
         default=None,
-        help="Optional checkpoint path to resume model and optimizer state from",
+        help="Optional checkpoint path to resume model and optimizer state from, or 'latest'",
     )
 
     parser.add_argument("--epochs", type=int, default=30, help="Number of epochs")
@@ -128,6 +132,12 @@ def parse_args():
         choices=("spawn", "fork", "forkserver"),
         default="spawn",
         help="Multiprocessing start method for DataLoader workers",
+    )
+    parser.add_argument(
+        "--resample_on_decode_failure",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Randomly resample replacement rows on decode failure",
     )
     parser.add_argument(
         "--optimizer",
@@ -187,6 +197,24 @@ def parse_args():
         default=1,
         help="Save model checkpoint every N epochs (N must be >= 1)",
     )
+    parser.add_argument(
+        "--save_every_n_steps",
+        type=int,
+        default=0,
+        help="Save model checkpoint every N optimizer steps (0 disables step checkpoints)",
+    )
+    parser.add_argument(
+        "--keep_last_n_step_checkpoints",
+        type=int,
+        default=2,
+        help="Keep only the newest N step checkpoints (N must be >= 1)",
+    )
+    parser.add_argument(
+        "--train_augmentation_mode",
+        choices=["clip_consistent", "legacy_frame_random", "none"],
+        default="clip_consistent",
+        help="Training augmentation policy",
+    )
     parser.add_argument("--gpus", type=int, nargs="+", help="GPU IDs")
     return parser.parse_args()
 
@@ -226,14 +254,182 @@ def _should_use_data_parallel(config):
     )
 
 
-def _save_checkpoint(model, optimizer, args, path, epoch, scaler=None):
+def _empty_train_stats():
+    return {
+        "loss_sum": 0.0,
+        "sample_count": 0,
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "tn": 0,
+    }
+
+
+def _normalize_train_stats(stats):
+    normalized = _empty_train_stats()
+    if not stats:
+        return normalized
+    normalized["loss_sum"] = float(stats.get("loss_sum", 0.0))
+    normalized["sample_count"] = int(stats.get("sample_count", 0))
+    normalized["tp"] = int(stats.get("tp", 0))
+    normalized["fp"] = int(stats.get("fp", 0))
+    normalized["fn"] = int(stats.get("fn", 0))
+    normalized["tn"] = int(stats.get("tn", 0))
+    return normalized
+
+
+def _combine_train_stats(lhs, rhs):
+    left = _normalize_train_stats(lhs)
+    right = _normalize_train_stats(rhs)
+    return {
+        "loss_sum": float(left["loss_sum"]) + float(right["loss_sum"]),
+        "sample_count": int(left["sample_count"]) + int(right["sample_count"]),
+        "tp": int(left["tp"]) + int(right["tp"]),
+        "fp": int(left["fp"]) + int(right["fp"]),
+        "fn": int(left["fn"]) + int(right["fn"]),
+        "tn": int(left["tn"]) + int(right["tn"]),
+    }
+
+
+def _capture_rng_state():
+    rng_state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        rng_state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return rng_state
+
+
+def _restore_rng_state(rng_state):
+    if not rng_state:
+        return
+    python_state = rng_state.get("python")
+    if python_state is not None:
+        random.setstate(python_state)
+    numpy_state = rng_state.get("numpy")
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+    torch_state = rng_state.get("torch")
+    if torch_state is not None:
+        torch.random.set_rng_state(torch_state)
+    cuda_state = rng_state.get("torch_cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def _manifest_path(run_dir: Path) -> Path:
+    return run_dir / LATEST_CHECKPOINT_MANIFEST
+
+
+def _relative_to_run_dir(path: Path, run_dir: Path) -> str:
+    return str(path.relative_to(run_dir))
+
+
+def _save_json(path: Path, payload) -> None:
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=4)
+
+
+def _update_latest_checkpoint_manifest(
+    run_dir: Path,
+    *,
+    latest_resume_checkpoint=None,
+    latest_resume_kind=None,
+    latest_step_checkpoint=None,
+    latest_epoch_checkpoint=None,
+    epoch=None,
+    global_step=None,
+    rank_sample_offset=None,
+):
+    manifest_file = _manifest_path(run_dir)
+    manifest = {}
+    if manifest_file.exists():
+        with open(manifest_file) as f:
+            manifest = json.load(f)
+
+    if latest_resume_checkpoint is not None:
+        manifest["latest_resume_checkpoint"] = latest_resume_checkpoint
+    if latest_resume_kind is not None:
+        manifest["latest_resume_kind"] = latest_resume_kind
+    if latest_step_checkpoint is not None:
+        manifest["latest_step_checkpoint"] = latest_step_checkpoint
+    if latest_epoch_checkpoint is not None:
+        manifest["latest_epoch_checkpoint"] = latest_epoch_checkpoint
+    if epoch is not None:
+        manifest["epoch"] = int(epoch)
+    if global_step is not None:
+        manifest["global_step"] = int(global_step)
+    if rank_sample_offset is not None:
+        manifest["rank_sample_offset"] = int(rank_sample_offset)
+
+    _save_json(manifest_file, manifest)
+
+
+def _prune_old_step_checkpoints(run_dir: Path, keep_last_n: int) -> None:
+    if keep_last_n < 1:
+        return
+    checkpoint_dir = run_dir / "checkpoints"
+    step_checkpoints = sorted(checkpoint_dir.glob("step_ep*_gstep*.pt"))
+    stale = step_checkpoints[:-keep_last_n]
+    for path in stale:
+        if path.exists():
+            path.unlink()
+
+
+def _resolve_resume_checkpoint_path(resume_checkpoint, run_dir: Path) -> Path:
+    requested = str(resume_checkpoint).strip()
+    if requested.lower() != "latest":
+        return Path(requested).expanduser()
+
+    manifest_file = _manifest_path(run_dir)
+    if not manifest_file.exists():
+        raise FileNotFoundError(
+            f"Requested RESUME_CHECKPOINT=latest, but manifest not found: {manifest_file}"
+        )
+    with open(manifest_file) as f:
+        manifest = json.load(f)
+
+    relative_checkpoint = str(manifest.get("latest_resume_checkpoint", "")).strip()
+    if not relative_checkpoint:
+        raise RuntimeError(
+            f"Manifest {manifest_file} does not contain latest_resume_checkpoint"
+        )
+    resolved = run_dir / relative_checkpoint
+    if not resolved.exists():
+        raise FileNotFoundError(
+            "Manifest points to a missing resume checkpoint: "
+            f"{resolved} (from {manifest_file})"
+        )
+    return resolved
+
+
+def _save_checkpoint(
+    model,
+    optimizer,
+    args,
+    path,
+    *,
+    epoch,
+    checkpoint_kind,
+    global_step,
+    rank_sample_offset=0,
+    partial_train_stats=None,
+    scaler=None,
+):
     checkpoint_model = _checkpoint_model(model)
     state_dict = checkpoint_model.state_dict()
 
     checkpoint = {
         "epoch": int(epoch),
+        "checkpoint_kind": str(checkpoint_kind),
+        "global_step": int(global_step),
+        "rank_sample_offset": int(rank_sample_offset),
         "state_dict": state_dict,
         "optimizer_state": optimizer.state_dict(),
+        "partial_train_stats": _normalize_train_stats(partial_train_stats),
+        "rng_state": _capture_rng_state(),
         "config": vars(args),
     }
     if scaler is not None:
@@ -264,7 +460,11 @@ def _load_resume_checkpoint(model, optimizer, checkpoint_path, device, scaler=No
     if not resume_path.exists():
         raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
 
-    checkpoint = torch.load(resume_path, map_location="cpu")
+    checkpoint = torch.load(
+        resume_path,
+        map_location="cpu",
+        weights_only=False,
+    )
     checkpoint_model = _checkpoint_model(model)
     load_result = checkpoint_model.load_state_dict(checkpoint["state_dict"], strict=True)
     if load_result.missing_keys or load_result.unexpected_keys:
@@ -284,8 +484,31 @@ def _load_resume_checkpoint(model, optimizer, checkpoint_path, device, scaler=No
     if scaler is not None and "scaler_state" in checkpoint:
         scaler.load_state_dict(checkpoint["scaler_state"])
 
-    completed_epoch = int(checkpoint.get("epoch", 0))
-    return resume_path, completed_epoch
+    checkpoint_kind = str(checkpoint.get("checkpoint_kind", "epoch")).strip().lower()
+    checkpoint_epoch = int(checkpoint.get("epoch", 0))
+    global_step = int(checkpoint.get("global_step", 0))
+    rank_sample_offset = int(checkpoint.get("rank_sample_offset", 0))
+    partial_train_stats = _normalize_train_stats(checkpoint.get("partial_train_stats"))
+    _restore_rng_state(checkpoint.get("rng_state"))
+
+    if checkpoint_kind == "step":
+        start_epoch = checkpoint_epoch
+        epoch_sample_offset = rank_sample_offset
+        initial_train_stats = partial_train_stats
+    else:
+        start_epoch = checkpoint_epoch + 1
+        epoch_sample_offset = 0
+        initial_train_stats = _empty_train_stats()
+
+    return {
+        "resume_path": resume_path,
+        "checkpoint_kind": checkpoint_kind,
+        "checkpoint_epoch": checkpoint_epoch,
+        "start_epoch": start_epoch,
+        "global_step": global_step,
+        "epoch_sample_offset": epoch_sample_offset,
+        "initial_train_stats": initial_train_stats,
+    }
 
 
 def _ensure_metrics_file(metrics_path, append=False):
@@ -410,6 +633,10 @@ def main():
         _validate_optional_ratio(config.neg_pos_ratio, "neg_pos_ratio")
         if int(config.save_every_n_epochs) < 1:
             raise ValueError("save_every_n_epochs must be >= 1")
+        if int(config.save_every_n_steps) < 0:
+            raise ValueError("save_every_n_steps must be >= 0")
+        if int(config.keep_last_n_step_checkpoints) < 1:
+            raise ValueError("keep_last_n_step_checkpoints must be >= 1")
         if int(config.gradient_accumulation_steps) < 1:
             raise ValueError("gradient_accumulation_steps must be >= 1")
 
@@ -443,6 +670,11 @@ def main():
         _log(runtime, f"Dataloader workers: train={config.num_workers}")
         _log(
             runtime,
+            "Train persistent workers: "
+            f"{'disabled' if config.train_augmentation_mode == 'clip_consistent' else 'enabled'}",
+        )
+        _log(
+            runtime,
             "Loader settings: "
             f"max_open_videos={config.max_open_videos}, "
             f"frame_cache_size={config.frame_cache_size}, "
@@ -455,6 +687,12 @@ def main():
             f"{config.gradient_checkpointing if config.gradient_checkpointing is not None else 'checkpoint_default'}",
         )
         _log(runtime, f"Save checkpoint every N epochs: {config.save_every_n_epochs}")
+        _log(runtime, f"Save checkpoint every N optimizer steps: {config.save_every_n_steps}")
+        _log(
+            runtime,
+            f"Training augmentation mode: {config.train_augmentation_mode}; "
+            f"resample_on_decode_failure={config.resample_on_decode_failure}",
+        )
 
         if runtime.is_distributed:
             device = torch.device(f"cuda:{runtime.local_rank}")
@@ -525,34 +763,63 @@ def main():
 
         start_epoch = 1
         resumed_from = None
+        resume_checkpoint_kind = ""
+        epoch_resume_sample_offset = 0
+        resume_epoch_train_stats = _empty_train_stats()
+        global_step = 0
         if args.resume_checkpoint:
-            resumed_from, completed_epoch = _load_resume_checkpoint(
+            resolved_resume_path = _resolve_resume_checkpoint_path(
+                args.resume_checkpoint,
+                run_dir,
+            )
+            resume_state = _load_resume_checkpoint(
                 model,
                 optimizer,
-                args.resume_checkpoint,
+                resolved_resume_path,
                 device,
                 trainer.scaler,
             )
-            start_epoch = completed_epoch + 1
+            resumed_from = resume_state["resume_path"]
+            resume_checkpoint_kind = str(resume_state["checkpoint_kind"])
+            start_epoch = int(resume_state["start_epoch"])
+            epoch_resume_sample_offset = int(resume_state["epoch_sample_offset"])
+            resume_epoch_train_stats = _normalize_train_stats(
+                resume_state["initial_train_stats"]
+            )
+            global_step = int(resume_state["global_step"])
             if start_epoch > config.epochs:
                 raise ValueError(
-                    f"Resume checkpoint {resumed_from} is already at epoch {completed_epoch}, "
+                    f"Resume checkpoint {resumed_from} starts at epoch {start_epoch}, "
                     f"which is beyond requested total epochs={config.epochs}."
                 )
-            _log(
-                runtime,
-                f"Resuming from checkpoint: {resumed_from} "
-                f"(completed epoch {completed_epoch}, next epoch {start_epoch})",
-            )
+            if resume_checkpoint_kind == "step":
+                _log(
+                    runtime,
+                    f"Resuming from step checkpoint: {resumed_from} "
+                    f"(epoch {start_epoch}, rank sample offset {epoch_resume_sample_offset}, "
+                    f"global optimizer step {global_step})",
+                )
+            else:
+                _log(
+                    runtime,
+                    f"Resuming from epoch checkpoint: {resumed_from} "
+                    f"(next epoch {start_epoch}, global optimizer step {global_step})",
+                )
 
         if runtime.is_main_process:
-            _ensure_metrics_file(metrics_path, append=start_epoch > 1)
+            _ensure_metrics_file(
+                metrics_path,
+                append=bool(args.resume_checkpoint and metrics_path.exists()),
+            )
         _distributed_barrier(runtime)
 
         last_epoch = start_epoch - 1
         for epoch in range(start_epoch, config.epochs + 1):
             last_epoch = epoch
-            train_sampler.set_epoch(epoch)
+            start_offset = epoch_resume_sample_offset if epoch == start_epoch else 0
+            train_sampler.set_epoch(epoch, start_offset=start_offset)
+            if hasattr(train_dataset, "set_epoch"):
+                train_dataset.set_epoch(epoch)
             train_counts = train_sampler.get_counts()
             if config.save_epoch_indices and runtime.is_main_process:
                 epoch_indices = (
@@ -568,9 +835,83 @@ def main():
             _log(runtime, f"\nEpoch {epoch}/{config.epochs}")
             _log(runtime, f"Train sample counts: {train_counts}")
 
-            train_stats = trainer.train_one_epoch(model, train_loader, optimizer, epoch)
-            reduced_train_stats = _reduce_train_stats(train_stats, device, runtime)
-            train_metrics = _finalize_train_metrics(reduced_train_stats)
+            initial_epoch_train_stats = (
+                resume_epoch_train_stats if epoch == start_epoch else _empty_train_stats()
+            )
+            starting_epoch_sample_offset = start_offset
+
+            def on_optimizer_step(step_state):
+                nonlocal global_step
+                global_step += 1
+
+                if int(config.save_every_n_steps) <= 0:
+                    return
+                if global_step % int(config.save_every_n_steps) != 0:
+                    return
+                if step_state["epoch_complete"]:
+                    return
+
+                reduced_segment_stats = _reduce_train_stats(
+                    step_state["stats"],
+                    device,
+                    runtime,
+                )
+                partial_train_stats = _combine_train_stats(
+                    initial_epoch_train_stats,
+                    reduced_segment_stats,
+                )
+                rank_sample_offset = (
+                    int(starting_epoch_sample_offset) + int(step_state["sample_count"])
+                )
+
+                _distributed_barrier(runtime)
+                if runtime.is_main_process:
+                    checkpoint_name = (
+                        f"step_ep{epoch:03d}_gstep{global_step:08d}.pt"
+                    )
+                    checkpoint_path = run_dir / "checkpoints" / checkpoint_name
+                    _save_checkpoint(
+                        model,
+                        optimizer,
+                        args,
+                        checkpoint_path,
+                        epoch=epoch,
+                        checkpoint_kind="step",
+                        global_step=global_step,
+                        rank_sample_offset=rank_sample_offset,
+                        partial_train_stats=partial_train_stats,
+                        scaler=trainer.scaler,
+                    )
+                    checkpoint_rel = _relative_to_run_dir(checkpoint_path, run_dir)
+                    _prune_old_step_checkpoints(
+                        run_dir,
+                        int(config.keep_last_n_step_checkpoints),
+                    )
+                    _update_latest_checkpoint_manifest(
+                        run_dir,
+                        latest_resume_checkpoint=checkpoint_rel,
+                        latest_resume_kind="step",
+                        latest_step_checkpoint=checkpoint_rel,
+                        epoch=epoch,
+                        global_step=global_step,
+                        rank_sample_offset=rank_sample_offset,
+                    )
+                    print(f"Saved step checkpoint: {checkpoint_path}")
+                _distributed_barrier(runtime)
+
+            train_stats = trainer.train_one_epoch(
+                model,
+                train_loader,
+                optimizer,
+                epoch,
+                on_optimizer_step=on_optimizer_step,
+            )
+            reduced_segment_train_stats = _reduce_train_stats(train_stats, device, runtime)
+            full_epoch_train_stats = _combine_train_stats(
+                initial_epoch_train_stats,
+                reduced_segment_train_stats,
+            )
+            train_metrics = _finalize_train_metrics(full_epoch_train_stats)
             _log(
                 runtime,
                 f"Train Loss: {train_metrics['train_loss']:.4f} "
@@ -596,10 +937,21 @@ def main():
                     optimizer,
                     args,
                     checkpoint_path,
-                    epoch,
-                    trainer.scaler,
+                    epoch=epoch,
+                    checkpoint_kind="epoch",
+                    global_step=global_step,
+                    scaler=trainer.scaler,
                 )
-                checkpoint_rel = f"checkpoints/{checkpoint_name}"
+                checkpoint_rel = _relative_to_run_dir(checkpoint_path, run_dir)
+                _update_latest_checkpoint_manifest(
+                    run_dir,
+                    latest_resume_checkpoint=checkpoint_rel,
+                    latest_resume_kind="epoch",
+                    latest_epoch_checkpoint=checkpoint_rel,
+                    epoch=epoch,
+                    global_step=global_step,
+                    rank_sample_offset=0,
+                )
                 print(f"Saved periodic checkpoint: {checkpoint_path}")
 
             if runtime.is_main_process:
@@ -613,6 +965,8 @@ def main():
                     )
 
             _distributed_barrier(runtime)
+            resume_epoch_train_stats = _empty_train_stats()
+            epoch_resume_sample_offset = 0
 
         if runtime.is_main_process:
             final_checkpoint_path = run_dir / "checkpoints" / "last.pt"
@@ -621,22 +975,35 @@ def main():
                 optimizer,
                 args,
                 final_checkpoint_path,
-                last_epoch,
-                trainer.scaler,
+                epoch=last_epoch,
+                checkpoint_kind="epoch",
+                global_step=global_step,
+                scaler=trainer.scaler,
+            )
+            final_checkpoint_rel = _relative_to_run_dir(final_checkpoint_path, run_dir)
+            _update_latest_checkpoint_manifest(
+                run_dir,
+                latest_resume_checkpoint=final_checkpoint_rel,
+                latest_resume_kind="epoch",
+                latest_epoch_checkpoint=final_checkpoint_rel,
+                epoch=last_epoch,
+                global_step=global_step,
+                rank_sample_offset=0,
             )
             print(f"Saved final checkpoint: {final_checkpoint_path}")
 
-            with open(artifacts_path, "w") as f:
-                json.dump(
-                    {
-                        "last_epoch": int(last_epoch),
-                        "final_checkpoint": "checkpoints/last.pt",
-                        "metrics_file": metrics_path.name,
-                        "resumed_from": str(resumed_from) if resumed_from is not None else "",
-                    },
-                    f,
-                    indent=4,
-                )
+            _save_json(
+                artifacts_path,
+                {
+                    "last_epoch": int(last_epoch),
+                    "global_step": int(global_step),
+                    "final_checkpoint": final_checkpoint_rel,
+                    "metrics_file": metrics_path.name,
+                    "latest_checkpoint_manifest": LATEST_CHECKPOINT_MANIFEST,
+                    "resumed_from": str(resumed_from) if resumed_from is not None else "",
+                    "resume_checkpoint_kind": resume_checkpoint_kind,
+                },
+            )
             print(f"Training complete. Artifacts: {artifacts_path}")
 
         _distributed_barrier(runtime)

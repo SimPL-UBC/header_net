@@ -1,5 +1,6 @@
 import random
 from collections import OrderedDict
+import hashlib
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple, Union
 
@@ -10,6 +11,7 @@ import pandas as pd
 import pyarrow.dataset as pads
 import torch
 import torchvision.transforms as T
+from torchvision.transforms import functional as TF
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
 
@@ -44,6 +46,7 @@ _OPTIONAL_PARQUET_COLUMNS = [
 
 PREPROCESS_MODES = {"torchvision", "low_memory_eval"}
 SPATIAL_MODES = {"ball_crop", "full_frame"}
+TRAIN_AUGMENTATION_MODES = {"clip_consistent", "legacy_frame_random", "none"}
 
 
 def _normalize_optional_strings(values: Optional[Iterable[Union[str, int]]]) -> tuple[str, ...]:
@@ -119,6 +122,12 @@ def _build_window_offsets(num_frames: int) -> np.ndarray:
     if num_frames % 2 == 0:
         return np.arange(-half, half, dtype=np.int32)
     return np.arange(-half, half + 1, dtype=np.int32)
+
+
+def _stable_seed(*values: object) -> int:
+    payload = "|".join(str(value) for value in values).encode("utf-8")
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
 
 
 def _seed_worker(worker_id: int) -> None:
@@ -295,7 +304,9 @@ class DeterministicRatioSampler(Sampler[int]):
                 f"rank must be in [0, {self.num_replicas - 1}], got {self.rank}"
             )
         self.current_epoch = 0
+        self.start_offset = 0
         self._global_indices = np.array([], dtype=np.int64)
+        self._rank_indices = np.array([], dtype=np.int64)
         self._indices = np.array([], dtype=np.int64)
         self._sample_count = 0
         self._negative_sample_count = 0
@@ -329,7 +340,7 @@ class DeterministicRatioSampler(Sampler[int]):
             return np.array([], dtype=np.int64)
         return np.concatenate(ordered_chunks).astype(np.int64, copy=False)
 
-    def set_epoch(self, epoch: int) -> None:
+    def set_epoch(self, epoch: int, start_offset: int = 0) -> None:
         self.current_epoch = int(epoch)
         rng = np.random.default_rng(self.seed + self.current_epoch)
 
@@ -350,7 +361,19 @@ class DeterministicRatioSampler(Sampler[int]):
         )
         self._sample_count = int(len(self._global_indices))
         self._negative_sample_count = int(self._sample_count - len(self.positive_indices))
-        self._indices = self._shard_indices(self._global_indices)
+        self._rank_indices = self._shard_indices(self._global_indices)
+        self.set_start_offset(start_offset)
+
+    def set_start_offset(self, start_offset: int) -> None:
+        offset = int(start_offset)
+        if offset < 0:
+            raise ValueError(f"start_offset must be >= 0, got {offset}")
+        if offset > len(self._rank_indices):
+            raise ValueError(
+                f"start_offset={offset} exceeds available rank-local samples={len(self._rank_indices)}"
+            )
+        self.start_offset = offset
+        self._indices = self._rank_indices[offset:].astype(np.int64, copy=False)
 
     def _shard_indices(self, global_indices: np.ndarray) -> np.ndarray:
         if self.num_replicas == 1:
@@ -382,6 +405,8 @@ class DeterministicRatioSampler(Sampler[int]):
             "samples": self._sample_count,
             "positives": int(len(self.positive_indices)),
             "negatives": self._negative_sample_count,
+            "processed_rank_samples": int(self.start_offset),
+            "remaining_rank_samples": int(len(self._indices)),
         }
 
 
@@ -401,6 +426,9 @@ class ParquetHeaderDataset(Dataset):
         resample_on_decode_failure: bool = True,
         preprocess_mode: str = "torchvision",
         spatial_mode: str = "ball_crop",
+        is_training: bool = False,
+        base_seed: int = 42,
+        train_augmentation_mode: str = "clip_consistent",
         video_id_filters: Optional[Iterable[Union[str, int]]] = None,
         half_filters: Optional[Iterable[Union[str, int]]] = None,
         frame_cache_size: int = 128,
@@ -419,6 +447,10 @@ class ParquetHeaderDataset(Dataset):
         self.resample_on_decode_failure = bool(resample_on_decode_failure)
         self.preprocess_mode = str(preprocess_mode)
         self.spatial_mode = str(spatial_mode)
+        self.is_training = bool(is_training)
+        self.base_seed = int(base_seed)
+        self.train_augmentation_mode = str(train_augmentation_mode)
+        self.current_epoch = 0
         self.video_id_filters = _normalize_optional_strings(video_id_filters)
         self.half_filters = _normalize_optional_ints(half_filters)
         if self.preprocess_mode not in PREPROCESS_MODES:
@@ -430,6 +462,11 @@ class ParquetHeaderDataset(Dataset):
             raise ValueError(
                 f"spatial_mode must be one of {sorted(SPATIAL_MODES)}, "
                 f"got {self.spatial_mode!r}"
+            )
+        if self.train_augmentation_mode not in TRAIN_AUGMENTATION_MODES:
+            raise ValueError(
+                "train_augmentation_mode must be one of "
+                f"{sorted(TRAIN_AUGMENTATION_MODES)}, got {self.train_augmentation_mode!r}"
             )
         self.cropper = FrameCropper(
             crop_scale_factor=crop_scale_factor,
@@ -536,6 +573,12 @@ class ParquetHeaderDataset(Dataset):
     def __len__(self) -> int:
         return len(self.labels)
 
+    def set_epoch(self, epoch: int) -> None:
+        self.current_epoch = int(epoch)
+
+    def get_epoch(self) -> int:
+        return int(self.current_epoch)
+
     def _build_center_detection(self, row_idx: int) -> Optional[Dict]:
         x = float(self.ball_x[row_idx])
         y = float(self.ball_y[row_idx])
@@ -608,11 +651,58 @@ class ParquetHeaderDataset(Dataset):
         )
         return [self.cropper.crop(frame, center_det, radius=radius) for frame in frames]
 
-    def _to_torchvision_video(self, frames: list[np.ndarray]) -> torch.Tensor:
+    def _sample_clip_augmentation_params(self, row_idx: int) -> Optional[Dict[str, object]]:
+        if not self.is_training or self.train_augmentation_mode != "clip_consistent":
+            return None
+
+        rng = random.Random(_stable_seed(self.base_seed, self.get_epoch(), row_idx))
+        brightness = rng.uniform(0.9, 1.1)
+        contrast = rng.uniform(0.9, 1.1)
+        saturation = rng.uniform(0.9, 1.1)
+        hue = rng.uniform(-0.1, 0.1)
+        color_ops = ["brightness", "contrast", "saturation", "hue"]
+        rng.shuffle(color_ops)
+        return {
+            "flip": rng.random() < 0.5,
+            "brightness": brightness,
+            "contrast": contrast,
+            "saturation": saturation,
+            "hue": hue,
+            "color_ops": tuple(color_ops),
+        }
+
+    def _apply_clip_augmentation_to_image(
+        self,
+        image: Image.Image,
+        augmentation_params: Optional[Dict[str, object]],
+    ) -> Image.Image:
+        if augmentation_params is None:
+            return image
+
+        if bool(augmentation_params["flip"]):
+            image = TF.hflip(image)
+
+        for op_name in augmentation_params["color_ops"]:
+            if op_name == "brightness":
+                image = TF.adjust_brightness(image, float(augmentation_params["brightness"]))
+            elif op_name == "contrast":
+                image = TF.adjust_contrast(image, float(augmentation_params["contrast"]))
+            elif op_name == "saturation":
+                image = TF.adjust_saturation(image, float(augmentation_params["saturation"]))
+            elif op_name == "hue":
+                image = TF.adjust_hue(image, float(augmentation_params["hue"]))
+        return image
+
+    def _to_torchvision_video(
+        self,
+        frames: list[np.ndarray],
+        augmentation_params: Optional[Dict[str, object]] = None,
+    ) -> torch.Tensor:
         processed = []
         for frame in frames:
             frame_array = frame.astype("uint8", copy=False)
             img = Image.fromarray(frame_array, "RGB")
+            img = self._apply_clip_augmentation_to_image(img, augmentation_params)
             if self.transform is not None:
                 tensor = self.transform(img)
             else:
@@ -656,10 +746,11 @@ class ParquetHeaderDataset(Dataset):
 
             center_det = self._build_center_detection(row_idx)
             frames = self._apply_spatial_policy(frames, center_det)
+            augmentation_params = self._sample_clip_augmentation_params(row_idx)
             if self._uses_low_memory_eval():
                 video = self._to_low_memory_video(frames)
             else:
-                video = self._to_torchvision_video(frames)
+                video = self._to_torchvision_video(frames, augmentation_params)
             del frames
             meta = {
                 "video_id": self._video_id_at(row_idx),
@@ -690,10 +781,14 @@ class ParquetHeaderDataset(Dataset):
         }
 
 
-def get_transforms(input_size: int = 224, is_training: bool = True):
+def get_transforms(
+    input_size: int = 224,
+    is_training: bool = True,
+    augmentation_mode: str = "clip_consistent",
+):
     normalize = T.Normalize(mean=VMAE_MEAN, std=VMAE_STD)
 
-    if is_training:
+    if is_training and augmentation_mode == "legacy_frame_random":
         return T.Compose(
             [
                 T.Resize((input_size, input_size)),
@@ -724,10 +819,15 @@ def _build_torch_generator(seed: int) -> torch.Generator:
     return generator
 
 
-def _dataloader_kwargs(num_workers: int, config: Config) -> Dict[str, object]:
+def _dataloader_kwargs(
+    num_workers: int,
+    config: Config,
+    *,
+    persistent_workers: bool = True,
+) -> Dict[str, object]:
     kwargs: Dict[str, object] = {}
     if num_workers > 0:
-        kwargs["persistent_workers"] = True
+        kwargs["persistent_workers"] = bool(persistent_workers)
         start_method = str(getattr(config, "loader_start_method", "spawn")).strip()
         if start_method:
             kwargs["multiprocessing_context"] = start_method
@@ -740,7 +840,12 @@ def build_parquet_train_dataloader(
     num_replicas: int = 1,
     rank: int = 0,
 ):
-    train_transform = get_transforms(config.input_size, is_training=True)
+    augmentation_mode = str(getattr(config, "train_augmentation_mode", "clip_consistent"))
+    train_transform = get_transforms(
+        config.input_size,
+        is_training=True,
+        augmentation_mode=augmentation_mode,
+    )
     train_dataset = ParquetHeaderDataset(
         parquet_path=config.train_parquet,
         num_frames=config.num_frames,
@@ -751,6 +856,12 @@ def build_parquet_train_dataloader(
         max_open_videos=int(getattr(config, "max_open_videos", 8)),
         frame_cache_size=int(getattr(config, "frame_cache_size", 128)),
         spatial_mode=str(getattr(config, "spatial_mode", "ball_crop")),
+        is_training=True,
+        base_seed=int(getattr(config, "seed", 42)),
+        train_augmentation_mode=augmentation_mode,
+        resample_on_decode_failure=bool(
+            getattr(config, "resample_on_decode_failure", True)
+        ),
         video_id_filters=getattr(config, "train_video_ids", ()),
         half_filters=getattr(config, "train_halves", ()),
     )
@@ -772,6 +883,7 @@ def build_parquet_train_dataloader(
 
     generator = _build_torch_generator(int(config.seed) + int(rank))
     num_workers = int(getattr(config, "num_workers", 0))
+    use_persistent_workers = augmentation_mode != "clip_consistent"
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -781,7 +893,11 @@ def build_parquet_train_dataloader(
         pin_memory=True,
         worker_init_fn=_seed_worker,
         generator=generator,
-        **_dataloader_kwargs(num_workers, config),
+        **_dataloader_kwargs(
+            num_workers,
+            config,
+            persistent_workers=use_persistent_workers,
+        ),
     )
     return train_loader, train_dataset, train_sampler
 
@@ -804,6 +920,12 @@ def build_parquet_val_dataloader(
         max_open_videos=int(getattr(config, "max_open_videos", 8)),
         frame_cache_size=int(getattr(config, "frame_cache_size", 128)),
         spatial_mode=str(getattr(config, "spatial_mode", "ball_crop")),
+        is_training=False,
+        base_seed=int(getattr(config, "seed", 42)),
+        train_augmentation_mode="none",
+        resample_on_decode_failure=bool(
+            getattr(config, "resample_on_decode_failure", True)
+        ),
         video_id_filters=getattr(config, "val_video_ids", ()),
         half_filters=getattr(config, "val_halves", ()),
     )

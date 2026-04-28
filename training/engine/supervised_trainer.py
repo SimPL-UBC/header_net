@@ -69,6 +69,17 @@ class Trainer:
             return 0.0
         return (2.0 * tp) / float(denominator)
 
+    @staticmethod
+    def empty_train_stats() -> dict[str, float | int]:
+        return {
+            "loss_sum": 0.0,
+            "sample_count": 0,
+            "tp": 0,
+            "fp": 0,
+            "fn": 0,
+            "tn": 0,
+        }
+
     def _autocast_context(self):
         if not self.amp_enabled:
             return nullcontext()
@@ -83,7 +94,15 @@ class Trainer:
             )(logits, targets)
         return F.cross_entropy(logits, targets, reduction="none")
 
-    def train_one_epoch(self, model, train_loader, optimizer, epoch):
+    def train_one_epoch(
+        self,
+        model,
+        train_loader,
+        optimizer,
+        epoch,
+        *,
+        on_optimizer_step=None,
+    ):
         model.train()
         loss_sum = 0.0
         sample_count = 0
@@ -105,7 +124,32 @@ class Trainer:
         optimizer.zero_grad(set_to_none=True)
         pending_microbatches = 0
         total_batches = len(train_loader) if hasattr(train_loader, "__len__") else None
+        optimizer_steps = 0
+        last_batch_idx = 0
+
+        def emit_step_callback(*, batch_idx: int, epoch_complete: bool) -> None:
+            if on_optimizer_step is None:
+                return
+            on_optimizer_step(
+                {
+                    "epoch": int(epoch),
+                    "batch_idx": int(batch_idx),
+                    "optimizer_steps": int(optimizer_steps),
+                    "sample_count": int(sample_count),
+                    "stats": {
+                        "loss_sum": float(loss_sum),
+                        "sample_count": int(sample_count),
+                        "tp": int(tp),
+                        "fp": int(fp),
+                        "fn": int(fn),
+                        "tn": int(tn),
+                    },
+                    "epoch_complete": bool(epoch_complete),
+                }
+            )
+
         for batch_idx, (inputs, targets, _) in enumerate(progress, start=1):
+            last_batch_idx = batch_idx
             inputs = inputs.to(self.device)
             targets = targets.to(self.device)
 
@@ -136,6 +180,13 @@ class Trainer:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 pending_microbatches = 0
+                optimizer_steps += 1
+                emit_step_callback(
+                    batch_idx=batch_idx,
+                    epoch_complete=bool(
+                        total_batches is not None and batch_idx == total_batches
+                    ),
+                )
 
             loss_sum += loss.item() * inputs.size(0)
             outputs_for_metrics = outputs.detach().float()
@@ -164,6 +215,13 @@ class Trainer:
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            optimizer_steps += 1
+            emit_step_callback(
+                batch_idx=last_batch_idx,
+                epoch_complete=bool(
+                    total_batches is not None and last_batch_idx == total_batches
+                ),
+            )
 
         correct = tp + tn
         epoch_loss = loss_sum / sample_count if sample_count > 0 else 0.0
@@ -177,6 +235,7 @@ class Trainer:
             "fp": int(fp),
             "fn": int(fn),
             "tn": int(tn),
+            "optimizer_steps": int(optimizer_steps),
             "train_loss": epoch_loss,
             "train_acc": epoch_acc,
             "train_f1": train_f1,

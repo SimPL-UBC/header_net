@@ -43,6 +43,7 @@ class Config:
     max_open_videos: int = 8
     frame_cache_size: int = 128
     loader_start_method: str = "spawn"
+    resample_on_decode_failure: bool = True
 
     # Loss
     loss_type: str = "focal"
@@ -59,12 +60,15 @@ class Config:
     f1_threshold_step: float = 0.01
     save_epoch_indices: bool = True
     save_every_n_epochs: int = 1
+    save_every_n_steps: int = 0
+    keep_last_n_step_checkpoints: int = 2
     run_intermediate_validation: bool = True
     validate_every_n_epochs: int = 1
     val_neg_pos_ratio: str = "all"
     run_final_test: bool = True
     val_pin_memory: bool = False
     val_progress_every: int = 1000
+    train_augmentation_mode: str = "clip_consistent"
 
 
 def merge_cli_args(args: argparse.Namespace) -> Config:
@@ -138,6 +142,8 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.frame_cache_size = args.frame_cache_size
     if hasattr(args, "loader_start_method"):
         config.loader_start_method = args.loader_start_method
+    if hasattr(args, "resample_on_decode_failure"):
+        config.resample_on_decode_failure = args.resample_on_decode_failure
 
     # Run
     if hasattr(args, "run_name"):
@@ -166,6 +172,10 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.save_epoch_indices = args.save_epoch_indices
     if hasattr(args, "save_every_n_epochs"):
         config.save_every_n_epochs = args.save_every_n_epochs
+    if hasattr(args, "save_every_n_steps"):
+        config.save_every_n_steps = args.save_every_n_steps
+    if hasattr(args, "keep_last_n_step_checkpoints"):
+        config.keep_last_n_step_checkpoints = args.keep_last_n_step_checkpoints
     if hasattr(args, "run_intermediate_validation"):
         config.run_intermediate_validation = args.run_intermediate_validation
     if hasattr(args, "validate_every_n_epochs"):
@@ -178,5 +188,7 @@ def merge_cli_args(args: argparse.Namespace) -> Config:
         config.val_pin_memory = args.val_pin_memory
     if hasattr(args, "val_progress_every"):
         config.val_progress_every = args.val_progress_every
+    if hasattr(args, "train_augmentation_mode"):
+        config.train_augmentation_mode = str(args.train_augmentation_mode)
 
     return config

@@ -13,7 +13,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # NEG_POS_RATIO: all|positive integer (e.g., 6)
 # BACKBONE_CKPT: VideoMAE checkpoint directory (default: Giant)
 # OUTPUT_ROOT, RUN_NAME
-# RESUME_CHECKPOINT: optional periodic checkpoint path (e.g. output/vmae/<run>/checkpoints/epoch_014.pt)
+# RESUME_CHECKPOINT: optional checkpoint path or 'latest'
 # FINETUNE_MODE: full|frozen|partial
 # UNFREEZE_BLOCKS
 # EPOCHS, BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS, NUM_FRAMES, NUM_WORKERS
@@ -25,6 +25,10 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # SEED, GPUS, USE_DDP
 # SAVE_EPOCH_INDICES: true|false
 # SAVE_EVERY_N_EPOCHS: save periodic checkpoints every N epochs (default: 1)
+# SAVE_EVERY_N_STEPS: save mid-epoch checkpoints every N optimizer steps (default: 5000)
+# KEEP_LAST_N_STEP_CHECKPOINTS: retain only the newest N step checkpoints (default: 2)
+# TRAIN_AUGMENTATION_MODE: clip_consistent|legacy_frame_random|none (default: clip_consistent)
+# RESAMPLE_ON_DECODE_FAILURE: true|false (default: false for reproducibility)
 # VALIDATE_VIDEO_LOAD: 1 to verify train parquet video paths can be opened/decoded before training (default: 1)
 # VALIDATE_VIDEO_LOAD_MAX_ERRORS: max unreadable paths to print (default: 20)
 # FILTER_BAD_WINDOWS: optional legacy pre-filter pass before training (default: 0)
@@ -85,6 +89,10 @@ GPUS="${GPUS:-0 1}"
 USE_DDP="${USE_DDP:-true}"
 SAVE_EPOCH_INDICES="${SAVE_EPOCH_INDICES:-true}"
 SAVE_EVERY_N_EPOCHS="${SAVE_EVERY_N_EPOCHS:-1}"
+SAVE_EVERY_N_STEPS="${SAVE_EVERY_N_STEPS:-5000}"
+KEEP_LAST_N_STEP_CHECKPOINTS="${KEEP_LAST_N_STEP_CHECKPOINTS:-2}"
+TRAIN_AUGMENTATION_MODE="${TRAIN_AUGMENTATION_MODE:-clip_consistent}"
+RESAMPLE_ON_DECODE_FAILURE="${RESAMPLE_ON_DECODE_FAILURE:-false}"
 VALIDATE_VIDEO_LOAD="${VALIDATE_VIDEO_LOAD:-1}"
 VALIDATE_VIDEO_LOAD_MAX_ERRORS="${VALIDATE_VIDEO_LOAD_MAX_ERRORS:-20}"
 FILTER_BAD_WINDOWS="${FILTER_BAD_WINDOWS:-0}"
@@ -195,6 +203,10 @@ echo "[INFO] GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING}"
 echo "[INFO] BATCH_SIZE=${BATCH_SIZE}"
 echo "[INFO] GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS}"
 echo "[INFO] USE_DDP=${USE_DDP}"
+echo "[INFO] SAVE_EVERY_N_STEPS=${SAVE_EVERY_N_STEPS}"
+echo "[INFO] KEEP_LAST_N_STEP_CHECKPOINTS=${KEEP_LAST_N_STEP_CHECKPOINTS}"
+echo "[INFO] TRAIN_AUGMENTATION_MODE=${TRAIN_AUGMENTATION_MODE}"
+echo "[INFO] RESAMPLE_ON_DECODE_FAILURE=${RESAMPLE_ON_DECODE_FAILURE}"
 
 NORMALIZED_GPUS="${GPUS//,/ }"
 read -r -a GPU_LIST <<<"${NORMALIZED_GPUS}"
@@ -232,7 +244,10 @@ ARGS=(
 	--focal_gamma "${FOCAL_GAMMA}"
 	--focal_alpha "${FOCAL_ALPHA}"
 	--save_every_n_epochs "${SAVE_EVERY_N_EPOCHS}"
+	--save_every_n_steps "${SAVE_EVERY_N_STEPS}"
+	--keep_last_n_step_checkpoints "${KEEP_LAST_N_STEP_CHECKPOINTS}"
 	--seed "${SEED}"
+	--train_augmentation_mode "${TRAIN_AUGMENTATION_MODE}"
 	--gpus "${GPU_LIST[@]}"
 )
 
@@ -252,6 +267,12 @@ if [[ "${SAVE_EPOCH_INDICES}" == "true" ]]; then
 	ARGS+=(--save_epoch_indices)
 else
 	ARGS+=(--no-save_epoch_indices)
+fi
+
+if is_enabled "${RESAMPLE_ON_DECODE_FAILURE}"; then
+	ARGS+=(--resample_on_decode_failure)
+else
+	ARGS+=(--no-resample_on_decode_failure)
 fi
 
 if [[ -n "${RESUME_CHECKPOINT}" ]]; then
