@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -16,6 +17,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_NEG_POS_RATIOS = ("3", "5", "8", "10", "15", "20")
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,15 @@ def parse_args() -> argparse.Namespace:
         "--study-name-prefix",
         default="optuna_vmae_parquet",
         help="Prefix for per-backbone Optuna study names",
+    )
+    parser.add_argument(
+        "--study-name-suffix",
+        default="auto",
+        help=(
+            "Suffix for study names. 'auto' appends a hash when NEG_POS_RATIOS "
+            "differs from the default, 'none' disables suffixing, any other value "
+            "is used as a custom suffix."
+        ),
     )
     parser.add_argument(
         "--storage",
@@ -175,7 +186,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--neg-pos-ratios",
         nargs="+",
-        default=["3", "5", "8", "10", "15", "20"],
+        default=list(DEFAULT_NEG_POS_RATIOS),
         help="Categorical train negative:positive ratios to sample",
     )
 
@@ -217,6 +228,50 @@ def parse_args() -> argparse.Namespace:
     if not args.neg_pos_ratios:
         raise ValueError("--neg-pos-ratios cannot be empty")
     return args
+
+
+def _sanitize_study_suffix(value: str) -> str:
+    sanitized = []
+    for char in str(value).strip():
+        if char.isalnum() or char in {"-", "_", "."}:
+            sanitized.append(char)
+        else:
+            sanitized.append("_")
+    return "".join(sanitized).strip("._-")
+
+
+def resolve_study_suffix(args: argparse.Namespace) -> str:
+    requested = str(args.study_name_suffix).strip()
+    if requested.lower() in {"", "none", "off", "false", "0"}:
+        return ""
+    if requested.lower() != "auto":
+        suffix = _sanitize_study_suffix(requested)
+        if not suffix:
+            raise ValueError(f"Invalid study name suffix: {args.study_name_suffix!r}")
+        return suffix
+
+    ratios = tuple(str(value) for value in args.neg_pos_ratios)
+    if ratios == DEFAULT_NEG_POS_RATIOS:
+        return ""
+
+    digest = hashlib.sha1("|".join(ratios).encode("utf-8")).hexdigest()[:8]
+    return f"np_{digest}"
+
+
+def resolve_backbone_output_dir(args: argparse.Namespace, backbone: str) -> Path:
+    output_root = _path(args.output_root)
+    suffix = resolve_study_suffix(args)
+    if suffix:
+        return output_root / backbone / suffix
+    return output_root / backbone
+
+
+def resolve_study_name(args: argparse.Namespace, backbone: str) -> str:
+    suffix = resolve_study_suffix(args)
+    study_name = f"{args.study_name_prefix}_{backbone}"
+    if suffix:
+        study_name = f"{study_name}_{suffix}"
+    return study_name
 
 
 def resolve_backbone_settings(args: argparse.Namespace, backbone: str) -> BackboneSettings:
@@ -731,7 +786,7 @@ def run_dry_run(args: argparse.Namespace) -> None:
     params = representative_params(args)
     for backbone in args.backbones:
         settings = resolve_backbone_settings(args, backbone)
-        backbone_dir = _path(args.output_root) / backbone
+        backbone_dir = resolve_backbone_output_dir(args, backbone)
         trial_dir = backbone_dir / "trial_0000"
         checkpoint_path = trial_dir / "checkpoints" / "last.pt"
         validation_dir = trial_dir / "validation"
@@ -752,6 +807,8 @@ def run_dry_run(args: argparse.Namespace) -> None:
         )
         print("")
         print(f"[DRY_RUN] Backbone: {backbone}")
+        print(f"[DRY_RUN] Study: {resolve_study_name(args, backbone)}")
+        print(f"[DRY_RUN] Output: {backbone_dir}")
         print(f"[DRY_RUN] Train: {command_to_text(train_cmd, train_env)}")
         print(f"[DRY_RUN] Eval:  {command_to_text(eval_cmd)}")
         if args.run_best_val_inference:
@@ -798,14 +855,14 @@ def run_study(args: argparse.Namespace, backbone: str) -> None:
 
     settings = resolve_backbone_settings(args, backbone)
     output_root = _path(args.output_root)
-    backbone_dir = output_root / backbone
+    backbone_dir = resolve_backbone_output_dir(args, backbone)
     backbone_dir.mkdir(parents=True, exist_ok=True)
 
     storage = args.storage.strip()
     if not storage:
         storage = f"sqlite:///{(output_root / 'optuna.db').resolve()}"
 
-    study_name = f"{args.study_name_prefix}_{backbone}"
+    study_name = resolve_study_name(args, backbone)
     sampler = optuna.samplers.TPESampler(seed=args.sampler_seed)
     study = optuna.create_study(
         study_name=study_name,
@@ -820,6 +877,7 @@ def run_study(args: argparse.Namespace, backbone: str) -> None:
     print(f"[STUDY] {study_name}")
     print(f"[STUDY] storage={storage}")
     print(f"[STUDY] output={backbone_dir}")
+    print(f"[STUDY] neg_pos_ratios={args.neg_pos_ratios}")
     print(f"[STUDY] objective={args.objective_metric}")
     print(f"[STUDY] trials_to_run={args.n_trials}")
     print("=" * 72)

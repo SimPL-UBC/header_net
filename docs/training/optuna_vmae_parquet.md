@@ -92,6 +92,22 @@ Change sampled negative:positive ratios:
 NEG_POS_RATIOS="5 8 10 15" job_script/optuna_vmae_parquet.sh
 ```
 
+Optuna does not allow changing categorical choices inside an existing study. The launcher handles this by default with `STUDY_NAME_SUFFIX=auto`: when `NEG_POS_RATIOS` differs from the default list, it creates a separate study name and separate output directory.
+
+To force a custom study identity:
+
+```bash
+STUDY_NAME_SUFFIX=wide_ratio_search NEG_POS_RATIOS="3 5 8 10 12 15" job_script/optuna_vmae_parquet.sh
+```
+
+To intentionally reuse the exact old study name, keep the same `NEG_POS_RATIOS` as the existing study or set:
+
+```bash
+STUDY_NAME_SUFFIX=none job_script/optuna_vmae_parquet.sh
+```
+
+Only use `STUDY_NAME_SUFFIX=none` when the categorical search space matches the previous study.
+
 Use AUC instead of F1:
 
 ```bash
@@ -174,6 +190,13 @@ Per-backbone outputs:
 ```text
 output/optuna_vmae_parquet/base/
 output/optuna_vmae_parquet/giant/
+```
+
+When `STUDY_NAME_SUFFIX=auto` creates a suffix for a changed ratio list, outputs are nested under the suffix:
+
+```text
+output/optuna_vmae_parquet/base/np_<hash>/
+output/optuna_vmae_parquet/giant/np_<hash>/
 ```
 
 Each trial writes:
